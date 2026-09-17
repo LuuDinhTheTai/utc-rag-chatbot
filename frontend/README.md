@@ -99,7 +99,7 @@ NEXT_PUBLIC_USE_MOCK=true
 
 Khi cấu hình `NEXT_PUBLIC_USE_MOCK=false`, frontend sẽ gửi request tới endpoint:
 
-- **Endpoint:** `POST ${NEXT_PUBLIC_API_URL}/api/chat`
+- **Endpoint:** `POST ${NEXT_PUBLIC_API_URL}/api/v1/chat`
 - **Headers:**
   - `Content-Type: application/json`
   - `Accept: text/event-stream`
