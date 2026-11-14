@@ -1,0 +1,20 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: utc-rag-backend
+  datasource:
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+  sql:
+    init:
+      mode: never
+
+app:
+  ollama:
+    base-url: ${OLLAMA_BASE_URL}
+    slm-model: ${SLM_MODEL}
+    embedding-model: ${EMBEDDING_MODEL}
+    embedding-dimension: ${EMBEDDING_DIMENSION:768}

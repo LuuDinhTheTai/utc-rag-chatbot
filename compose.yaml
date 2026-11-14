@@ -1,0 +1,91 @@
+name: utc-rag-chatbot
+
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-5173}:5173"
+    environment:
+      BACKEND_PROXY_TARGET: http://backend:8080
+    depends_on:
+      backend:
+        condition: service_started
+    networks: [utc]
+
+  backend:
+    build: ./backend
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8080}:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://database:5432/${POSTGRES_DB:-utc_rag}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-utc}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env and set POSTGRES_PASSWORD}
+      OLLAMA_BASE_URL: http://ai:11434
+      SLM_MODEL: ${SLM_MODEL:-qwen3:0.6b}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-embeddinggemma:300m-qat-q4_0}
+      EMBEDDING_DIMENSION: "768"
+    depends_on:
+      database:
+        condition: service_healthy
+      ai:
+        condition: service_healthy
+    networks: [utc]
+
+  tools:
+    build: ./tools
+    environment:
+      POSTGRES_HOST: database
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-utc_rag}
+      POSTGRES_USER: ${POSTGRES_USER:-utc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      OLLAMA_BASE_URL: http://ai:11434
+      SLM_MODEL: ${SLM_MODEL:-qwen3:0.6b}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-embeddinggemma:300m-qat-q4_0}
+      EMBEDDING_DIMENSION: "768"
+      UTC_SOURCE_URL: ${UTC_SOURCE_URL:-https://tuyensinh.utc.edu.vn}
+    depends_on:
+      database:
+        condition: service_healthy
+      ai:
+        condition: service_healthy
+    networks: [utc]
+
+  database:
+    image: pgvector/pgvector:0.8.7-pg17-trixie
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-utc_rag}
+      POSTGRES_USER: ${POSTGRES_USER:-utc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init/001-enable-vector.sql:/docker-entrypoint-initdb.d/001-enable-vector.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [utc]
+
+  ai:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: [CMD, ollama, list]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [utc]
+
+networks:
+  utc:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  ollama_data:
