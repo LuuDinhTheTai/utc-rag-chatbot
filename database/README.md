@@ -4,6 +4,9 @@ Schema PostgreSQL 17 + pgvector theo [ERD v2](https://docs.google.com/document/d
 
 - `init/001-enable-vector.sql`: bật extension vector, giữ nguyên từ scaffold.
 - `init/002-schema.sql`: tạo bảng, PK/UK/FK, khóa ngoại ghép và indexes FK.
+- `init/003-api-state.sql`: bổ sung trạng thái API, khóa phiên bản, chống xuất bản
+  đồng thời, chống job đang hoạt động bị trùng và liên kết lượt chat.
+- `init/004-public-views.sql`: view truy vấn công khai, loại dữ liệu có nguồn bị thu hồi.
 - `tests/verify-schema.sql`: kiểm tra các ràng buộc bằng fixtures trong transaction rollback.
 
 ## Volume mới
@@ -27,6 +30,12 @@ Get-Content -Raw database/init/002-schema.sql | docker compose exec -T database 
 Script chạy một lần, toàn bộ DDL trong transaction. Nếu bảng đã tồn tại hoặc có
 lỗi, script dừng và rollback, không tự bỏ qua schema lệch. Không chạy lại sau khi
 đã init thành công; các thay đổi tiếp theo cần migration riêng. Không dùng `down -v`.
+
+Database đã có ERD v2 cần áp dụng lần lượt 003 và 004 một lần như hướng dẫn
+trong [backend/README.md](../backend/README.md). Các file này đã được áp dụng vào
+database local trong lượt triển khai backend. Không chạy lại toàn bộ init trên
+volume hiện có. `scripts/bootstrap-admin.sql` chỉ cấp ADMIN cho tài khoản đã đăng
+ký, không tạo tài khoản hoặc mật khẩu mặc định.
 
 ## Kiểm tra
 
