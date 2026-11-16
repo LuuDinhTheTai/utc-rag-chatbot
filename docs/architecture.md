@@ -3,8 +3,9 @@
 ## Phạm vi
 
 Scaffold chỉ có cấu hình hạ tầng và mã khởi động. Chưa có giao diện chatbot,
-API nghiệp vụ, logic RAG/crawler, authentication, schema/migrations, dữ liệu mẫu
-hoặc thuật toán xử lý tài liệu.
+API nghiệp vụ, logic RAG/crawler, authentication, dữ liệu mẫu
+hoặc thuật toán xử lý tài liệu. Database đã được khởi tạo theo ERD v2 gồm 48 bảng;
+xem [hướng dẫn database](../database/README.md). Chưa có công cụ migration tự động.
 
 ```mermaid
 flowchart TD
@@ -62,8 +63,9 @@ Docker trực tiếp. Các biến nội bộ không được nhúng vào bundle 
 
 - `postgres_data`: `/var/lib/postgresql/data` cho PostgreSQL 17.
 - `ollama_data`: `/root/.ollama`, lưu chung cả hai model.
-- SQL init mount read-only, chỉ bật extension `vector`; không tạo bảng hay dữ liệu.
-  Chỉ chạy tự động khi volume database rỗng.
+- Thư mục SQL init mount read-only, bật extension `vector` và tạo 48 bảng theo ERD v2,
+  không seed dữ liệu. Chỉ chạy tự động khi volume database rỗng; volume hiện có
+  cần áp dụng schema một lần theo hướng dẫn database.
 - Backend/Tools đợi database và AI healthy. Frontend đợi backend được khởi động;
   `service_started` không bảo đảm backend đã sẵn sàng nhận HTTP.
 - PostgreSQL healthcheck dùng `pg_isready`; Ollama dùng `ollama list`.
@@ -71,8 +73,8 @@ Docker trực tiếp. Các biến nội bộ không được nhúng vào bundle 
 - Pull model thủ công vào chính `ai`, không thêm service thứ sáu. Mặc định CPU.
 - Không mount source, không scheduler, không tự tải model. Build lại sau khi sửa mã.
 
-Dimension 768 là hợp đồng cho các thành phần tương lai; chưa có cột `vector(768)`
-hay mã tạo embedding. Cần giữ thống nhất model/dimension khi phát triển schema.
+Dimension 768 được cố định ở cột `document_chunks.embedding vector(768)`;
+chưa có mã tạo embedding. Cần giữ thống nhất model/dimension khi phát triển.
 Tag Ollama `latest` có thể thay đổi; nhóm có thể pin tag/digest sau khi xác nhận
 phiên bản hoạt động. Runtime local sau khi tải images/dependencies/models;
 crawler tương lai vẫn cần Internet để đọc website UTC.
