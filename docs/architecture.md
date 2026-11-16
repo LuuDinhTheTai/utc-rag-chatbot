@@ -2,10 +2,11 @@
 
 ## Phạm vi
 
-Scaffold chỉ có cấu hình hạ tầng và mã khởi động. Chưa có giao diện chatbot,
-API nghiệp vụ, logic RAG/crawler, authentication, dữ liệu mẫu
-hoặc thuật toán xử lý tài liệu. Database đã được khởi tạo theo ERD v2 gồm 48 bảng;
-xem [hướng dẫn database](../database/README.md). Chưa có công cụ migration tự động.
+Backend đã triển khai REST API cho sáu nhóm chức năng, authentication/CSRF,
+phân quyền, biên tập/xuất bản và gọi Ollama. Xem [hướng dẫn backend](../backend/README.md)
+và OpenAPI trong backend. Frontend và Tools vẫn là scaffold; chưa có giao diện
+chatbot hoặc worker crawler/index tài liệu. Database gồm 48 bảng ERD v2 và các
+cột/index/view bổ sung phục vụ hợp đồng API, không seed dữ liệu.
 
 ```mermaid
 flowchart TD
@@ -18,22 +19,22 @@ flowchart TD
     Tools --> UTC[Website tuyển sinh UTC]
 ```
 
-Các mũi tên biểu diễn hướng kết nối khi phát triển. Hiện chưa có lời gọi API,
-truy vấn database, client Ollama hoặc crawling.
+Backend đã có truy vấn database và client Ollama. Frontend chưa gọi API;
+các kết nối từ Tools là hướng phát triển worker tiếp theo.
 
 ## Năm services
 
 | Service | Nền tảng và cấu hình | Vai trò tương lai |
 | --- | --- | --- |
 | `frontend` | React + TypeScript + Vite; tiêu đề tối thiểu, proxy `/api` | Website |
-| `backend` | Java 21 + Spring Boot 3.5 + JDBC PostgreSQL | API và điều phối RAG |
+| `backend` | Java 21 + Spring Boot 3.5 + Spring Data JPA / Hibernate PostgreSQL | API và điều phối RAG |
 | `tools` | Python 3.12; tiến trình chờ tín hiệu dừng | Crawler, xử lý và đồng bộ tài liệu |
 | `database` | `pgvector/pgvector:0.8.7-pg17-trixie` | Dữ liệu nghiệp vụ và embeddings |
 | `ai` | Một container `ollama/ollama:latest` | SLM và embedding chạy local |
 
-Backend chưa có controller, repository hoặc AI client. JDBC đã có datasource
-nhưng chưa có truy vấn. Tools chưa cài thư viện crawler/database/AI; thêm các
-dependencies khi triển khai tính năng. Vite dùng làm development server local.
+Backend dùng Spring Data JPA/Hibernate và native SQL qua EntityManager, REST controller/service theo nhóm chức năng
+và RestClient cho Ollama. Tools chưa cài thư viện crawler/database/AI; thêm các
+dependencies khi triển khai worker. Vite dùng làm development server local.
 
 ## Network và environment
 
@@ -63,11 +64,12 @@ Docker trực tiếp. Các biến nội bộ không được nhúng vào bundle 
 
 - `postgres_data`: `/var/lib/postgresql/data` cho PostgreSQL 17.
 - `ollama_data`: `/root/.ollama`, lưu chung cả hai model.
+- `document_uploads`: `/app/uploads`, lưu PDF đã nhận từ API nộp tài liệu.
 - Thư mục SQL init mount read-only, bật extension `vector` và tạo 48 bảng theo ERD v2,
   không seed dữ liệu. Chỉ chạy tự động khi volume database rỗng; volume hiện có
   cần áp dụng schema một lần theo hướng dẫn database.
-- Backend/Tools đợi database và AI healthy. Frontend đợi backend được khởi động;
-  `service_started` không bảo đảm backend đã sẵn sàng nhận HTTP.
+- Backend/Tools đợi database và AI healthy. Frontend đợi backend healthy;
+  readiness backend bao gồm kiểm tra JDBC tới database.
 - PostgreSQL healthcheck dùng `pg_isready`; Ollama dùng `ollama list`.
   Healthcheck không kiểm tra đã tải model hoặc đã bật extension.
 - Pull model thủ công vào chính `ai`, không thêm service thứ sáu. Mặc định CPU.

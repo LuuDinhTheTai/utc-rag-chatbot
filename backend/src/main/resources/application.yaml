@@ -1,5 +1,17 @@
 server:
   port: 8080
+  servlet:
+    session:
+      timeout: 24h
+      tracking-modes: cookie
+      cookie:
+        name: UTC_SESSION
+        http-only: true
+        same-site: lax
+        secure: ${SESSION_COOKIE_SECURE:false}
+  error:
+    include-message: never
+    include-stacktrace: never
 
 spring:
   application:
@@ -11,10 +23,47 @@ spring:
   sql:
     init:
       mode: never
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+    deserialization:
+      fail-on-unknown-properties: true
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 21MB
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db
 
 app:
+  rate-limits:
+    login-failures: ${LOGIN_MAX_FAILURES:5}
+    login-window-seconds: ${LOGIN_WINDOW_SECONDS:900}
+    chat-per-minute: ${CHAT_PER_MINUTE:10}
+    scores-per-minute: ${SCORES_PER_MINUTE:30}
+    uploads-per-minute: ${UPLOADS_PER_MINUTE:10}
+    jobs-per-minute: ${JOBS_PER_MINUTE:10}
   ollama:
     base-url: ${OLLAMA_BASE_URL}
     slm-model: ${SLM_MODEL}
     embedding-model: ${EMBEDDING_MODEL}
     embedding-dimension: ${EMBEDDING_DIMENSION:768}
+    connect-timeout: ${OLLAMA_CONNECT_TIMEOUT:5s}
+    read-timeout: ${OLLAMA_READ_TIMEOUT:120s}
+  cursor-secret: ${CURSOR_SECRET}
+  upload-directory: ${UPLOAD_DIRECTORY:/app/uploads}
