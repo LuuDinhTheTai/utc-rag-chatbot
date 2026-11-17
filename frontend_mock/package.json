@@ -1,0 +1,22 @@
+{
+  "name": "utc-rag-frontend-mock",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5174 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "test:mock": "node --experimental-strip-types --test tests/mock.test.mjs"
+  },
+  "dependencies": {
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.10",
+    "@types/react-dom": "19.1.9",
+    "@vitejs/plugin-react": "^5.2.0",
+    "typescript": "5.9.2",
+    "vite": "^7.3.8"
+  }
+}
