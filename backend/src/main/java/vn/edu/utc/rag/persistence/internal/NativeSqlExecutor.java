@@ -9,7 +9,7 @@ import org.hibernate.query.NativeQuery;
 import org.postgresql.util.PGobject;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
-import vn.edu.utc.rag.common.ApiException;
+import vn.edu.utc.rag.exception.ApiException;
 
 @Repository
 @Transactional

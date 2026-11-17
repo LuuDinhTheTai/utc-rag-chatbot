@@ -1,5 +1,7 @@
 # Kiến trúc UTC RAG Chatbot
 
+Backend chia theo tầng và nghiệp vụ: xem [cấu trúc backend](backend-layout.md).
+
 ## Phạm vi
 
 Backend đã triển khai REST API cho sáu nhóm chức năng, authentication/CSRF,

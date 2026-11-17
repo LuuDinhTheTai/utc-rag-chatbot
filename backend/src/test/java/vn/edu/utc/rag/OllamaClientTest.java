@@ -7,8 +7,9 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import org.junit.jupiter.api.*;
-import vn.edu.utc.rag.ai.*;
-import vn.edu.utc.rag.common.ApiException;
+import vn.edu.utc.rag.config.properties.OllamaProperties;
+import vn.edu.utc.rag.exception.ApiException;
+import vn.edu.utc.rag.integration.ollama.OllamaClient;
 
 class OllamaClientTest {
   HttpServer server;

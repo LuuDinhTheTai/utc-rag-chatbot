@@ -6,16 +6,16 @@ import com.fasterxml.jackson.databind.*;
 import java.util.*;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.bind.annotation.*;
-import vn.edu.utc.rag.administration.AdminController;
-import vn.edu.utc.rag.catalog.CatalogController;
-import vn.edu.utc.rag.chat.ChatController;
-import vn.edu.utc.rag.editorial.EditorialController;
-import vn.edu.utc.rag.editorial.EditorialService;
-import vn.edu.utc.rag.identity.IdentityController;
-import vn.edu.utc.rag.ingestion.DocumentsController;
-import vn.edu.utc.rag.ingestion.OpsController;
-import vn.edu.utc.rag.personality.PersonalityController;
-import vn.edu.utc.rag.scoring.ScoringController;
+import vn.edu.utc.rag.controller.administration.AdminController;
+import vn.edu.utc.rag.controller.catalog.CatalogController;
+import vn.edu.utc.rag.controller.chat.ChatController;
+import vn.edu.utc.rag.controller.editorial.EditorialController;
+import vn.edu.utc.rag.controller.identity.IdentityController;
+import vn.edu.utc.rag.controller.ingestion.DocumentsController;
+import vn.edu.utc.rag.controller.ingestion.OpsController;
+import vn.edu.utc.rag.controller.personality.PersonalityController;
+import vn.edu.utc.rag.controller.scoring.ScoringController;
+import vn.edu.utc.rag.service.editorial.EditorialService;
 
 class ContractTest {
   String normalize(String path) {
@@ -91,9 +91,9 @@ class ContractTest {
 
   @Test
   void idAndDecimalParsingDoesNotLosePrecision() {
-    assertThat(vn.edu.utc.rag.common.Input.id("9007199254740993")).isEqualTo(9007199254740993L);
-    assertThat(vn.edu.utc.rag.common.Input.decimal("8.50").toPlainString()).isEqualTo("8.50");
-    assertThatThrownBy(() -> vn.edu.utc.rag.common.Input.id(9007199254740993L))
-        .isInstanceOf(vn.edu.utc.rag.common.ApiException.class);
+    assertThat(vn.edu.utc.rag.validation.Input.id("9007199254740993")).isEqualTo(9007199254740993L);
+    assertThat(vn.edu.utc.rag.validation.Input.decimal("8.50").toPlainString()).isEqualTo("8.50");
+    assertThatThrownBy(() -> vn.edu.utc.rag.validation.Input.id(9007199254740993L))
+        .isInstanceOf(vn.edu.utc.rag.exception.ApiException.class);
   }
 }

@@ -3,10 +3,10 @@
 ```mermaid
 flowchart TD
     C[Controller] --> S[Service: nghiệp vụ và giao dịch]
-    S --> R[Repository theo miền]
-    R --> J[Spring Data JpaRepository: CRUD và JPQL]
+    S --> J[Spring Data JpaRepository: CRUD và JPQL]
     J --> E[Hibernate EntityManager]
-    R --> N[Custom query: cursor, tổng hợp, PostgreSQL]
+    S --> N[Custom QueryRepository: cursor, tổng hợp, PostgreSQL]
+    S --> M[Mapper và Response DTO]
     N --> E
     E --> DB[(PostgreSQL 17 + pgvector)]
 ```
@@ -14,24 +14,27 @@ flowchart TD
 ## Trách nhiệm
 
 - Controller ánh xạ HTTP và gọi service. Các lớp `ChatService`, `OpsService`,
-  `DocumentApiService`, `ScoringApiService` chứa phần điều phối trước đây nằm trong
+  `ProgramService`, `ScoreRuleService` chứa phần điều phối trước đây nằm trong
   controller. Một số service vẫn nhận request để sử dụng phiên và quyền hiện tại.
 - Service giữ luật nghiệp vụ, kiểm tra quyền, ETag và ranh giới `@Transactional`.
   Không truyền câu SQL xuống repository.
-- Các lớp `*DataRepository` và `CatalogReadRepository` cung cấp phương thức theo
-  thao tác của miền. Không nhận servlet request; đọc phân trang dùng `QueryPage`,
-  còn phạm vi quyền dùng `CampusScope`.
+- Service gọi trực tiếp repository JPA, không đi qua lớp bọc CRUD. Các lớp
+  `*QueryRepository` chỉ giữ truy vấn đặc thù và đều nằm trong
+  `persistence/repository/query`. Không nhận servlet request; đọc phân trang dùng
+  `QueryPage`, còn phạm vi quyền dùng `CampusScope`.
 - `persistence/repository` chứa 48 interface Spring Data JPA ánh xạ 48 entity.
   Các thao tác tạo dùng `save`/`saveAndFlush`; tìm theo ID dùng `findById`, các bộ lọc
   đơn giản dùng derived query. Repository nhận tham số có kiểu, không dùng map tham số
   hoặc truy vấn trùng theo từng caller. Join/projection và bulk delete dùng JPQL.
-  `EditorialEntityWriter` dựng từng entity bằng setter cụ thể;
-  `EditorialVersionsRepository` điều phối repository cho năm nhóm phiên bản.
-- `EntityViews` tạo projection giữ hợp đồng JSON hiện tại, bao gồm ID dạng chuỗi.
+  `EditorialMapper` dựng entity bằng setter cụ thể, không lưu dữ liệu;
+  `EditorialService` gọi repository tương ứng và quản lý năm nhóm phiên bản.
+- `mapper/common/EntityMapper` tạo projection giữ hợp đồng JSON hiện tại, bao gồm ID dạng chuỗi.
   Một số custom repository tại ranh giới API vẫn dùng map tham số/projection để giữ
   hợp đồng; các interface Spring Data đã dùng tham số có kiểu. Role và option join
-  dùng record projection. `IdentityDataRepository` và `PermissionsDataRepository`
-  đã được bỏ; service/security component gọi repository JPA trực tiếp.
+  dùng record projection. Quản trị tài khoản dùng `AccountResponse`, `RoleResponse`,
+  `IdResponse` và `AccountMapper`; các response linh hoạt khác vẫn giữ projection
+  dạng map để không thay đổi API. Mapper không có repository, EntityManager hoặc
+  transaction. `AuditService` thực hiện ghi audit qua `AuditEventsRepository`.
 
 ## Ranh giới native SQL
 

@@ -6,9 +6,11 @@ import java.security.*;
 import java.time.*;
 import java.util.*;
 import org.springframework.stereotype.Component;
-import vn.edu.utc.rag.common.*;
+import org.springframework.transaction.annotation.Transactional;
+import vn.edu.utc.rag.exception.ApiException;
 
 @Component
+@Transactional()
 public class Access {
 
   public record Account(UUID id, int epoch) implements Serializable {}
@@ -16,10 +18,14 @@ public class Access {
   public record Guest(String hash, Instant expires) implements Serializable {}
 
   public Access(
-      AccessDataRepository repository,
-      vn.edu.utc.rag.persistence.repository.UsersRepository users) {
-    this.repository = repository;
+      vn.edu.utc.rag.persistence.repository.UsersRepository users,
+      vn.edu.utc.rag.persistence.repository.ConversationsRepository conversations,
+      vn.edu.utc.rag.persistence.repository.PersonalityAttemptsRepository attempts,
+      vn.edu.utc.rag.mapper.common.EntityMapper views) {
     this.users = users;
+    this.conversations = conversations;
+    this.attempts = attempts;
+    this.views = views;
   }
 
   public UUID user(HttpServletRequest req) {
@@ -69,7 +75,7 @@ public class Access {
     Guest g = guest(req, false);
     if (u == null && g == null)
       throw new ApiException(401, "UNAUTHENTICATED", "Initialize a valid session first.");
-    var row = repository.findRecordsForOwn(Map.of("id", id), table);
+    var row = findRecordsForOwn(Map.of("id", id), table);
     boolean owned = u != null && u.toString().equals(row.get("owner_user_id"));
     boolean guestOwned = g != null && g.hash().equals(row.get("guest_token_hash"));
     if (!owned && !guestOwned) throw ApiException.missing();
@@ -90,6 +96,26 @@ public class Access {
     }
   }
 
-  private final AccessDataRepository repository;
   private final vn.edu.utc.rag.persistence.repository.UsersRepository users;
+
+  private Map<String, Object> findRecordsForOwn(Map<String, ?> parameters, String table) {
+    UUID id = (UUID) parameters.get("id");
+    Object entity =
+        switch (table) {
+          case "conversations" ->
+              conversations
+                  .findById(id)
+                  .orElseThrow(vn.edu.utc.rag.exception.ApiException::missing);
+          case "personality_attempts" ->
+              attempts.findById(id).orElseThrow(vn.edu.utc.rag.exception.ApiException::missing);
+          default -> throw new IllegalArgumentException("Unsupported ownership resource");
+        };
+    return views.of(entity);
+  }
+
+  private final vn.edu.utc.rag.persistence.repository.ConversationsRepository conversations;
+
+  private final vn.edu.utc.rag.persistence.repository.PersonalityAttemptsRepository attempts;
+
+  private final vn.edu.utc.rag.mapper.common.EntityMapper views;
 }

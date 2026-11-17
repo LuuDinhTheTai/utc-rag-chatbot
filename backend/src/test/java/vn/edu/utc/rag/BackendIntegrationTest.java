@@ -21,9 +21,10 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.*;
 import org.springframework.test.web.servlet.request.*;
 import org.springframework.transaction.annotation.Transactional;
-import vn.edu.utc.rag.ai.OllamaClient;
-import vn.edu.utc.rag.common.*;
+import vn.edu.utc.rag.exception.ApiException;
+import vn.edu.utc.rag.integration.ollama.OllamaClient;
 import vn.edu.utc.rag.security.Access;
+import vn.edu.utc.rag.validation.Input;
 
 /**
  * Real PostgreSQL tests. The runner creates a disposable database, never the development database.

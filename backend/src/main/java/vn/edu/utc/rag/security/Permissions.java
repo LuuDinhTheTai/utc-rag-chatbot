@@ -3,7 +3,7 @@ package vn.edu.utc.rag.security;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.*;
 import org.springframework.stereotype.Component;
-import vn.edu.utc.rag.common.*;
+import vn.edu.utc.rag.exception.ApiException;
 
 @Component
 public class Permissions {

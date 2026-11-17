@@ -3,7 +3,8 @@ package vn.edu.utc.rag.security;
 import java.time.*;
 import java.util.*;
 import org.springframework.stereotype.Component;
-import vn.edu.utc.rag.common.ApiException;
+import vn.edu.utc.rag.config.properties.RateLimitProperties;
+import vn.edu.utc.rag.exception.ApiException;
 
 @Component
 public class RateLimits {
