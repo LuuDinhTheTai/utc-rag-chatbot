@@ -6,6 +6,7 @@ import java.util.*;
 @Entity
 @Table(name = "subject_combinations")
 public class SubjectCombinationsEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "smallint")

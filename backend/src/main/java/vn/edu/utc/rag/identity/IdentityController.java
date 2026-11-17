@@ -10,8 +10,11 @@ import vn.edu.utc.rag.security.Access;
 @RestController
 @RequestMapping("/api/v1")
 public class IdentityController {
+
   private final IdentityService service;
+
   private final Access access;
+
   private final CsrfTokenRepository csrf;
 
   public IdentityController(IdentityService service, Access access, CsrfTokenRepository csrf) {

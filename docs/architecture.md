@@ -86,3 +86,8 @@ crawler tương lai vẫn cần Internet để đọc website UTC.
 - [pgvector Docker và extension](https://github.com/pgvector/pgvector)
 - [EmbeddingGemma Q4](https://ollama.com/library/embeddinggemma:300m-qat-q4_0)
 - [Spring Boot 3.5 system requirements](https://docs.spring.io/spring-boot/3.5/system-requirements.html)
+
+# Backend persistence
+
+Controller → Service → Repository → PostgreSQL. Xem [kiến trúc Spring Data JPA](backend-persistence.md)
+để phân biệt CRUD/JPQL, custom native query và trách nhiệm từng tầng.

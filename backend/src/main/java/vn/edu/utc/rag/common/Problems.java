@@ -18,6 +18,7 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
 @Component
 @RestControllerAdvice
 public class Problems extends ResponseEntityExceptionHandler {
+
   private final ObjectMapper mapper;
 
   public Problems(ObjectMapper mapper) {

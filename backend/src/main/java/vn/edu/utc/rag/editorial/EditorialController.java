@@ -11,6 +11,7 @@ import vn.edu.utc.rag.common.Input;
 @RequestMapping(
     "/api/v1/editorial/{kind:admission-cycles|program-offerings|guide-items|financial-policies|score-rules}")
 public class EditorialController {
+
   private final EditorialService service;
 
   public EditorialController(EditorialService service) {

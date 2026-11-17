@@ -11,12 +11,12 @@ import vn.edu.utc.rag.security.RateLimits;
 
 @Service
 public class ScoringService {
-  private final Db db;
+
   private final RateLimits limits;
 
-  public ScoringService(Db db, RateLimits limits) {
-    this.db = db;
+  public ScoringService(RateLimits limits, ScoringDataRepository repository) {
     this.limits = limits;
+    this.repository = repository;
   }
 
   @SuppressWarnings("unchecked")
@@ -32,17 +32,10 @@ public class ScoringService {
         "inputs");
     long version = Input.id(b.get("rule_version_id"));
     // Lock the source and version so revocation/publication cannot race a calculation.
-    var rule =
-        db.one(
-            "SELECT v.*,r.campus_id,r.admission_year,r.method_id,s.source FROM score_rule_versions"
-                + " v JOIN score_rules r ON r.id=v.score_rule_id JOIN api_verified_sources s ON"
-                + " s.id=v.source_revision_id WHERE v.id=:id FOR SHARE OF v",
-            Map.of("id", version));
+    var rule = repository.findScoreRuleVersionsForCalculate(Map.of("id", version));
     if (!"PUBLISHED".equals(rule.get("status")))
       throw new ApiException(409, "RULE_VERSION_CHANGED", "Reload the current score form.");
-    db.one(
-        "SELECT id FROM document_revisions WHERE id=:id AND revoked_at IS NULL AND source_verified"
-            + " FOR SHARE",
+    repository.findDocumentRevisionsForCalculate(
         Map.of("id", Input.id(rule.get("source_revision_id"))));
     String formula = rule.get("formula_key").toString();
     if (!Set.of("SUM", "WEIGHTED_SUM", "SUM_BANDS").contains(formula))
@@ -52,10 +45,7 @@ public class ScoringService {
     Object weightsRaw = config.getOrDefault("weights", Map.of());
     if (!(weightsRaw instanceof Map<?, ?> weights))
       throw ApiException.invalid("Invalid formula weights.");
-    var definitions =
-        db.list(
-            "SELECT * FROM score_rule_inputs WHERE rule_version_id=:v ORDER BY id",
-            Map.of("v", version));
+    var definitions = repository.findScoreRuleInputsForCalculate(Map.of("v", version));
     var inputs = Input.objects(b, "inputs");
     Map<String, Map<String, Object>> byCode = new HashMap<>();
     for (var i : inputs) {
@@ -86,9 +76,7 @@ public class ScoringService {
           throw ApiException.invalid("Input is out of range: " + code);
       }
       var bands =
-          db.list(
-              "SELECT * FROM score_rule_bands WHERE rule_input_id=:id ORDER BY id",
-              Map.of("id", Input.id(definition.get("id"))));
+          repository.findScoreRuleBandsForCalculate(Map.of("id", Input.id(definition.get("id"))));
       BigDecimal converted = value;
       if (!bands.isEmpty() || choice || formula.equals("SUM_BANDS")) {
         var matches =
@@ -150,12 +138,7 @@ public class ScoringService {
     if (b.get("admission_option_id") == null)
       throw ApiException.invalid("admission_option_id is required for comparison.");
     var option =
-        db.one(
-            "SELECT o.id,po.program_id,c.campus_id,c.admission_year,m.method_id,c.round_code FROM"
-                + " admission_options o JOIN admission_choices ch ON ch.id=o.choice_id JOIN"
-                + " program_offerings po ON po.id=ch.program_offering_id JOIN api_admission_cycles"
-                + " c ON c.version_id=o.cycle_version_id JOIN cycle_methods m ON"
-                + " m.id=o.cycle_method_id WHERE o.id=:id",
+        repository.findAdmissionOptionsForCompare(
             Map.of("id", Input.id(b.get("admission_option_id"))));
     if (!Objects.equals(option.get("campus_id"), rule.get("campus_id"))
         || !Objects.equals(option.get("admission_year"), rule.get("admission_year"))
@@ -169,22 +152,12 @@ public class ScoringService {
     args.put("round", option.get("round_code"));
     args.put("scale", rule.get("output_scale_code"));
     args.put("combination", b.get("combination_code"));
-    var cutoffs =
-        db.list(
-            "SELECT cutoff.score FROM admission_cutoffs cutoff JOIN admission_options o ON"
-                + " o.id=cutoff.option_id JOIN admission_choices ch ON ch.id=o.choice_id JOIN"
-                + " program_offerings po ON po.id=ch.program_offering_id JOIN api_admission_cycles"
-                + " c ON c.version_id=o.cycle_version_id JOIN cycle_methods m ON"
-                + " m.id=o.cycle_method_id JOIN api_verified_sources s ON"
-                + " s.id=cutoff.source_revision_id LEFT JOIN subject_combinations comb ON"
-                + " comb.id=cutoff.combination_id WHERE c.campus_id=:campus AND"
-                + " c.admission_year=:year AND po.program_id=:program AND m.method_id=:method AND"
-                + " c.round_code=:round AND cutoff.scale_code=:scale AND comb.code IS NOT DISTINCT"
-                + " FROM :combination",
-            args);
+    var cutoffs = repository.findAdmissionCutoffsForCompare(args);
     if (cutoffs.size() != 1)
       return Map.of("status", "NO_COMPARABLE_CUTOFF", "reason", "NO_UNIQUE_MATCHING_CUTOFF");
     var cutoff = new BigDecimal(cutoffs.getFirst().get("score").toString());
     return Map.of("status", "COMPARED", "cutoff", cutoff, "difference", total.subtract(cutoff));
   }
+
+  private final ScoringDataRepository repository;
 }

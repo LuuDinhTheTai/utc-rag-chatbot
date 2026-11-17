@@ -7,6 +7,7 @@ import java.util.*;
 @Table(name = "admission_option_combinations")
 @IdClass(AdmissionOptionCombinationsEntityId.class)
 public class AdmissionOptionCombinationsEntity {
+
   @Id
   @Column(name = "option_id", columnDefinition = "bigint")
   private Long optionId;

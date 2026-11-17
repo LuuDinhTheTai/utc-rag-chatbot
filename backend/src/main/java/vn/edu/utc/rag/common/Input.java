@@ -4,6 +4,7 @@ import java.math.BigDecimal;
 import java.util.*;
 
 public final class Input {
+
   private Input() {}
 
   public static String text(Map<String, Object> body, String key) {

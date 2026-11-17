@@ -10,23 +10,25 @@ import vn.edu.utc.rag.common.*;
 
 @Component
 public class Access {
+
   public record Account(UUID id, int epoch) implements Serializable {}
 
   public record Guest(String hash, Instant expires) implements Serializable {}
 
-  private final Db db;
-
-  public Access(Db db) {
-    this.db = db;
+  public Access(
+      AccessDataRepository repository,
+      vn.edu.utc.rag.persistence.repository.UsersRepository users) {
+    this.repository = repository;
+    this.users = users;
   }
 
   public UUID user(HttpServletRequest req) {
     var s = req.getSession(false);
     if (s == null || !(s.getAttribute("account") instanceof Account a)) return null;
-    var rows = db.list("SELECT status,auth_epoch FROM users WHERE id=:id", Map.of("id", a.id()));
-    if (rows.isEmpty()
-        || !"ACTIVE".equals(rows.getFirst().get("status"))
-        || ((Number) rows.getFirst().get("auth_epoch")).intValue() != a.epoch()) {
+    var account = users.findById(a.id());
+    if (account.isEmpty()
+        || !"ACTIVE".equals(account.get().getStatus())
+        || account.get().getAuthEpoch() != a.epoch()) {
       s.invalidate();
       throw new ApiException(401, "UNAUTHENTICATED", "Session is no longer valid.");
     }
@@ -67,7 +69,7 @@ public class Access {
     Guest g = guest(req, false);
     if (u == null && g == null)
       throw new ApiException(401, "UNAUTHENTICATED", "Initialize a valid session first.");
-    var row = db.one("SELECT * FROM " + table + " WHERE id=:id", Map.of("id", id));
+    var row = repository.findRecordsForOwn(Map.of("id", id), table);
     boolean owned = u != null && u.toString().equals(row.get("owner_user_id"));
     boolean guestOwned = g != null && g.hash().equals(row.get("guest_token_hash"));
     if (!owned && !guestOwned) throw ApiException.missing();
@@ -87,4 +89,7 @@ public class Access {
       throw new IllegalStateException(e);
     }
   }
+
+  private final AccessDataRepository repository;
+  private final vn.edu.utc.rag.persistence.repository.UsersRepository users;
 }

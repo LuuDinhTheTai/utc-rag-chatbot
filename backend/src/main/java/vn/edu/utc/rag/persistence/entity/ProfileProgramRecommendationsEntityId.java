@@ -4,7 +4,9 @@ import java.io.Serializable;
 import java.util.*;
 
 public class ProfileProgramRecommendationsEntityId implements Serializable {
+
   public Long profileId;
+
   public Long programId;
 
   public ProfileProgramRecommendationsEntityId() {}

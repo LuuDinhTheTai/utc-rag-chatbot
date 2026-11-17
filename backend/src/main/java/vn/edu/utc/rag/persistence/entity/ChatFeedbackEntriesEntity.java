@@ -7,6 +7,7 @@ import java.util.*;
 @Entity
 @Table(name = "chat_feedback_entries")
 public class ChatFeedbackEntriesEntity {
+
   @Id
   @Column(name = "answer_id", columnDefinition = "uuid")
   private UUID answerId;

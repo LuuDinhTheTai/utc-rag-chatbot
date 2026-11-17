@@ -1,5 +1,6 @@
 package vn.edu.utc.rag.persistence.entity;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import java.time.Instant;
 import java.util.*;
@@ -8,11 +9,12 @@ import org.hibernate.type.SqlTypes;
 
 @Entity
 @Table(name = "personality_attempts")
-public class PersonalityAttemptsEntity {
+public class PersonalityAttemptsEntity
+    implements org.springframework.data.domain.Persistable<UUID> {
+
   @Id
-  @GeneratedValue(strategy = GenerationType.UUID)
   @Column(name = "id", columnDefinition = "uuid")
-  private UUID id;
+  private UUID id = UUID.randomUUID();
 
   public UUID getId() {
     return id;
@@ -131,5 +133,19 @@ public class PersonalityAttemptsEntity {
 
   public void setSavedAt(Instant value) {
     this.savedAt = value;
+  }
+
+  @Transient private boolean fresh = true;
+
+  @JsonIgnore
+  @Override
+  public boolean isNew() {
+    return fresh;
+  }
+
+  @PostLoad
+  @PostPersist
+  public void markStored() {
+    fresh = false;
   }
 }

@@ -7,6 +7,7 @@ import java.util.*;
 @Entity
 @Table(name = "schedule_events")
 public class ScheduleEventsEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")

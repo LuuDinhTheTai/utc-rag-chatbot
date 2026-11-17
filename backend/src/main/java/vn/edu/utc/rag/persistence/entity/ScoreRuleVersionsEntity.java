@@ -9,6 +9,7 @@ import org.hibernate.type.SqlTypes;
 @Entity
 @Table(name = "score_rule_versions")
 public class ScoreRuleVersionsEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")

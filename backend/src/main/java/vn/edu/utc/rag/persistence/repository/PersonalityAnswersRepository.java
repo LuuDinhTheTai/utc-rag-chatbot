@@ -4,4 +4,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import vn.edu.utc.rag.persistence.entity.*;
 
 public interface PersonalityAnswersRepository
-    extends JpaRepository<PersonalityAnswersEntity, PersonalityAnswersEntityId> {}
+    extends JpaRepository<PersonalityAnswersEntity, PersonalityAnswersEntityId> {
+
+  int deleteByAttemptId(java.util.UUID id);
+}

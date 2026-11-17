@@ -10,6 +10,7 @@ import vn.edu.utc.rag.common.Input;
 @RestController
 @RequestMapping("/api/v1/admin")
 public class AdminController {
+
   private final AdminService service;
 
   public AdminController(AdminService service) {

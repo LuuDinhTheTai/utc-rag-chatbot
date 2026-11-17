@@ -6,6 +6,7 @@ import java.util.*;
 @Entity
 @Table(name = "campuses")
 public class CampusesEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "smallint")

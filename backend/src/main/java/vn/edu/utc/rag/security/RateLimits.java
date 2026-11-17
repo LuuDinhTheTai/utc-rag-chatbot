@@ -7,7 +7,9 @@ import vn.edu.utc.rag.common.ApiException;
 
 @Component
 public class RateLimits {
+
   private final Map<String, ArrayDeque<Instant>> windows = new HashMap<>();
+
   private final RateLimitProperties properties;
 
   public RateLimits(RateLimitProperties properties) {

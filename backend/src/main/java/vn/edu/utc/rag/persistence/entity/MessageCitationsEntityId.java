@@ -4,7 +4,9 @@ import java.io.Serializable;
 import java.util.*;
 
 public class MessageCitationsEntityId implements Serializable {
+
   public UUID messageId;
+
   public Short position;
 
   public MessageCitationsEntityId() {}

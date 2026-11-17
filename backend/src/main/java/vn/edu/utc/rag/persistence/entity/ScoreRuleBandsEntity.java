@@ -7,6 +7,7 @@ import java.util.*;
 @Entity
 @Table(name = "score_rule_bands")
 public class ScoreRuleBandsEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")

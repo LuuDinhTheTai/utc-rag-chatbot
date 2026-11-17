@@ -1,16 +1,17 @@
 package vn.edu.utc.rag.persistence.entity;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import java.time.Instant;
 import java.util.*;
 
 @Entity
 @Table(name = "users")
-public class UsersEntity {
+public class UsersEntity implements org.springframework.data.domain.Persistable<UUID> {
+
   @Id
-  @GeneratedValue(strategy = GenerationType.UUID)
   @Column(name = "id", columnDefinition = "uuid")
-  private UUID id;
+  private UUID id = UUID.randomUUID();
 
   public UUID getId() {
     return id;
@@ -73,5 +74,19 @@ public class UsersEntity {
 
   public void setCreatedAt(Instant value) {
     this.createdAt = value;
+  }
+
+  @Transient private boolean fresh = true;
+
+  @JsonIgnore
+  @Override
+  public boolean isNew() {
+    return fresh;
+  }
+
+  @PostLoad
+  @PostPersist
+  public void markStored() {
+    fresh = false;
   }
 }

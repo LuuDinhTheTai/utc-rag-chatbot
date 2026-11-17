@@ -1,6 +1,12 @@
 package vn.edu.utc.rag.persistence.repository;
 
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import vn.edu.utc.rag.persistence.entity.*;
 
-public interface ProgramOfferingsRepository extends JpaRepository<ProgramOfferingsEntity, Long> {}
+public interface ProgramOfferingsRepository extends JpaRepository<ProgramOfferingsEntity, Long> {
+
+  @Lock(LockModeType.PESSIMISTIC_WRITE)
+  java.util.Optional<ProgramOfferingsEntity> findLockedById(Long id);
+}

@@ -8,6 +8,53 @@ Schema request/response chưa có tệp nguồn đi kèm được xác lập tro
 
 ## Cấu trúc
 
+```text
+backend/
+├── Dockerfile                         # Build Maven và chạy ứng dụng Java
+├── .dockerignore                      # Loại tệp không cần khỏi Docker build context
+├── pom.xml                            # Dependencies và cấu hình Maven
+├── README.md
+├── scripts/
+│   └── test.ps1                        # Chạy tests với database riêng trên Docker
+└── src/
+    ├── main/
+    │   ├── java/vn/edu/utc/rag/
+    │   │   ├── UtcRagApplication.java  # Điểm khởi động Spring Boot
+    │   │   ├── administration/        # Quản trị tài khoản và quyền
+    │   │   ├── ai/                    # Kết nối Ollama và cấu hình model
+    │   │   ├── catalog/               # Tra cứu dữ liệu công khai
+    │   │   ├── chat/                  # Hội thoại, tin nhắn và điều phối RAG
+    │   │   ├── common/                # Tiện ích, JSON và xử lý lỗi chung
+    │   │   ├── config/                # Cấu hình Spring
+    │   │   ├── editorial/             # Biên tập, phiên bản và xuất bản
+    │   │   ├── identity/              # Đăng ký, đăng nhập và hồ sơ
+    │   │   ├── ingestion/             # Tài liệu, nguồn và crawl job
+    │   │   ├── persistence/
+    │   │   │   ├── entity/            # JPA entity và khóa ghép IdClass
+    │   │   │   ├── repository/        # Spring Data JPA repository
+    │   │   │   ├── query/             # Cursor, QueryPage và CampusScope
+    │   │   │   └── internal/          # NativeSqlExecutor và EntityViews
+    │   │   ├── personality/           # Bài trắc nghiệm và gợi ý ngành
+    │   │   ├── scoring/               # Quy tắc và tính điểm tuyển sinh
+    │   │   └── security/              # Phiên, CSRF và phân quyền
+    │   └── resources/
+    │       ├── application.yaml       # Cấu hình ứng dụng qua biến môi trường
+    │       └── static/
+    │           └── openapi.json       # Hợp đồng REST API
+    └── test/java/vn/edu/utc/rag/
+        ├── ArchitectureTest.java      # Kiểm tra ranh giới các tầng
+        ├── BackendIntegrationTest.java # Kiểm thử tích hợp PostgreSQL và API
+        ├── ContractTest.java          # Đối chiếu endpoints với OpenAPI
+        ├── OllamaClientTest.java      # Kiểm thử HTTP client Ollama
+        └── config/                    # Kiểm thử cấu hình JSON
+```
+
+Cây trên tập trung vào thư mục và tệp cấu hình chính. Trong mỗi package nghiệp vụ,
+`*Controller` nhận HTTP request, `*Service` xử lý nghiệp vụ và `*DataRepository`
+hoặc custom repository thực hiện truy cập dữ liệu. Các repository này sử dụng
+interface Spring Data JPA trong `persistence/repository` và entity tương ứng trong
+`persistence/entity`. Thư mục `target/` do Maven sinh ra khi build.
+
 | Package | Trách nhiệm |
 | --- | --- |
 | `identity`, `security` | Tài khoản, cookie phiên, CSRF, quyền theo cơ sở, giới hạn tần suất |
@@ -17,16 +64,40 @@ Schema request/response chưa có tệp nguồn đi kèm được xác lập tro
 | `ingestion` | Nộp PDF, xác minh/thu hồi nguồn, tạo và theo dõi crawl job |
 | `personality`, `scoring` | Đáp án, chấm theo cấu hình, gợi ý ngành, PDF, quy đổi điểm |
 | `administration` | Tài khoản, cấp/thu hồi quyền, auth_epoch |
-| `common`, `config` | SQL/JSON, cursor, lỗi RFC 9457, request ID và cấu hình |
+| `common`, `config` | JSON, lỗi RFC 9457, request ID và cấu hình |
+| `persistence/entity`, `persistence/repository` | Entity và Spring Data JPA repository cho 48 bảng |
+| `persistence/query`, `persistence/internal` | Phân trang, phạm vi cơ sở và thực thi native SQL nội bộ |
 
-Controller nhận request, service điều phối giao dịch. `persistence/entity` và
-`persistence/repository` ánh xạ đủ 48 bảng. Khóa ghép dùng IdClass; JSONB và vector
-768 chiều dùng Hibernate types. Đăng ký/đăng nhập dùng UsersRepository; tạo dữ liệu
-biên tập dùng JpaRepository qua JpaStore. Các truy vấn tổng hợp, cursor, khóa và
-pgvector giữ native SQL có parameter binding qua EntityManager trong Db.
-Native mutation flush/clear persistence context để tránh đọc trạng thái cũ.
-FK ánh xạ bằng ID scalar; không tự cascade hoặc trả entity trực tiếp ra API.
-`ddl-auto=validate`, `open-in-view=false`: Hibernate không sửa schema.
+Luồng chính là **Controller → Service → Repository → PostgreSQL**. Controller nhận
+request; service kiểm tra nghiệp vụ, phân quyền và điều phối giao dịch. Repository
+theo từng miền che giấu truy vấn và sử dụng các `JpaRepository` cụ thể cho CRUD/JPQL.
+Repository Spring Data nhận tham số có kiểu (`UUID`, `Long`, `String`...), dùng
+`findById`, derived query và JPQL khi cần join/projection. Không truyền map tham số
+vào interface Spring Data hoặc tạo nhiều phương thức tìm ID theo từng nơi gọi.
+Ưu tiên derived query cho lọc, sắp xếp, đếm và xóa theo thuộc tính. Không viết
+`@Query` cho tìm ID hoặc cập nhật từng entity; `@Lock` đặt trên phương thức derived
+thực sự chạy truy vấn. JPQL còn lại dành cho tổng hợp, join/projection và bulk delete
+có subquery hoặc quan hệ tin nhắn tự tham chiếu. Quy ước này được kiểm tra trong `ArchitectureTest`.
+Ví dụ xem [UsersRepository](src/main/java/vn/edu/utc/rag/persistence/repository/UsersRepository.java)
+và [EditorialVersionsRepository](src/main/java/vn/edu/utc/rag/editorial/EditorialVersionsRepository.java).
+Không còn `Db`, `SqlWrite` hoặc cơ chế tìm repository/gán entity bằng reflection.
+
+Luồng phiên bản biên tập tải entity qua repository, khóa khi cần và cập nhật bằng
+setter trong transaction. Hibernate dirty checking ghi thay đổi; việc archive được
+flush trước khi publish bản mới để bảo đảm ràng buộc chỉ có một bản đang xuất bản.
+Kiểm tra tài liệu theo phạm vi cơ sở dùng JPA Specification. Phần tài khoản và
+phân quyền gọi trực tiếp repository JPA, không qua lớp chỉ bọc truy vấn.
+
+Các truy vấn đọc tổng hợp trên view, phân trang cursor, pgvector, upsert PostgreSQL
+và khóa bảng bảo vệ tài khoản quản trị cuối cùng vẫn dùng native SQL trong custom repository.
+`NativeSqlExecutor` là chi tiết nội bộ của tầng persistence; controller/service
+không gọi nó. Đây là kiến trúc kết hợp JPA và custom query, chưa chuyển toàn bộ SQL
+sang ORM. [Tài liệu persistence](../docs/backend-persistence.md) mô tả ranh giới này.
+
+Khóa ghép dùng IdClass; JSONB và vector 768 chiều dùng Hibernate types. Native
+mutation flush/clear persistence context để tránh đọc trạng thái cũ. FK ánh xạ bằng
+ID scalar; API trả projection thay vì entity. `ddl-auto=validate`,
+`open-in-view=false`: Hibernate không sửa schema.
 
 ## Khởi động
 

@@ -7,6 +7,7 @@ import java.util.*;
 @Entity
 @Table(name = "guide_versions")
 public class GuideVersionsEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")

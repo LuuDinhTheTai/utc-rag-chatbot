@@ -7,6 +7,7 @@ import java.util.*;
 @Table(name = "combination_subjects")
 @IdClass(CombinationSubjectsEntityId.class)
 public class CombinationSubjectsEntity {
+
   @Id
   @Column(name = "combination_id", columnDefinition = "smallint")
   private Short combinationId;

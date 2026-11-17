@@ -8,6 +8,7 @@ import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
 @SpringBootApplication(exclude = UserDetailsServiceAutoConfiguration.class)
 @ConfigurationPropertiesScan
 public class UtcRagApplication {
+
   public static void main(String[] args) {
     SpringApplication.run(UtcRagApplication.class, args);
   }

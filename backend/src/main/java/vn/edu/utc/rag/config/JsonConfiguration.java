@@ -10,6 +10,7 @@ import org.springframework.context.annotation.*;
 
 @Configuration
 public class JsonConfiguration {
+
   @Bean
   Jackson2ObjectMapperBuilderCustomizer wireTypes() {
     return b -> {
@@ -18,6 +19,7 @@ public class JsonConfiguration {
       b.serializerByType(
           BigDecimal.class,
           new JsonSerializer<BigDecimal>() {
+
             @Override
             public void serialize(BigDecimal value, JsonGenerator gen, SerializerProvider provider)
                 throws IOException {

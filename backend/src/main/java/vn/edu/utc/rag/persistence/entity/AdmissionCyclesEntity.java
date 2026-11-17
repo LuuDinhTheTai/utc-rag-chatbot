@@ -6,6 +6,7 @@ import java.util.*;
 @Entity
 @Table(name = "admission_cycles")
 public class AdmissionCyclesEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")

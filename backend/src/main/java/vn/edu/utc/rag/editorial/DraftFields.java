@@ -6,32 +6,11 @@ import org.springframework.stereotype.Component;
 import vn.edu.utc.rag.common.*;
 
 @Component
-public class SqlWrite {
-  private final Db db;
+public class DraftFields {
+  private final JsonCodec json;
 
-  private final vn.edu.utc.rag.persistence.JpaStore store;
-
-  public SqlWrite(Db db, vn.edu.utc.rag.persistence.JpaStore store) {
-    this.db = db;
-    this.store = store;
-  }
-
-  public Map<String, Object> insert(String table, Map<String, Object> fields) {
-    Object key = store.insert(table, fields);
-    if (key instanceof java.io.Serializable && !(key instanceof Number) && !(key instanceof UUID)) {
-      var args = new HashMap<String, Object>();
-      var predicates = new ArrayList<String>();
-      for (var f : key.getClass().getFields())
-        try {
-          String column = f.getName().replaceAll("([a-z])([A-Z])", "$1_$2").toLowerCase();
-          args.put(column, f.get(key));
-          predicates.add(column + "=:" + column);
-        } catch (IllegalAccessException e) {
-          throw new IllegalStateException(e);
-        }
-      return db.one("SELECT * FROM " + table + " WHERE " + String.join(" AND ", predicates), args);
-    }
-    return db.one("SELECT * FROM " + table + " WHERE id=:id", Map.of("id", key));
+  public DraftFields(JsonCodec json) {
+    this.json = json;
   }
 
   public static Object value(String name, Object value) {
@@ -99,7 +78,7 @@ public class SqlWrite {
       if (!key.isEmpty()) result.put(key, value(key, body.get(key)));
     }
     result.replaceAll(
-        (k, v) -> k.endsWith("_config") || k.equals("score_weights") ? db.encode(v) : v);
+        (k, v) -> k.endsWith("_config") || k.equals("score_weights") ? json.encode(v) : v);
     return result;
   }
 }

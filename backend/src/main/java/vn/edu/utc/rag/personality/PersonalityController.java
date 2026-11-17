@@ -9,19 +9,21 @@ import org.apache.pdfbox.pdmodel.*;
 import org.apache.pdfbox.pdmodel.font.PDType0Font;
 import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
-import vn.edu.utc.rag.catalog.CatalogController;
 import vn.edu.utc.rag.common.*;
 import vn.edu.utc.rag.security.Access;
 
 @RestController
 @RequestMapping("/api/v1")
 public class PersonalityController {
+
   private final PersonalityService service;
-  private final CatalogController catalog;
+
+  private final vn.edu.utc.rag.catalog.CatalogService catalog;
+
   private final Access access;
 
   public PersonalityController(
-      PersonalityService service, CatalogController catalog, Access access) {
+      PersonalityService service, vn.edu.utc.rag.catalog.CatalogService catalog, Access access) {
     this.service = service;
     this.catalog = catalog;
     this.access = access;

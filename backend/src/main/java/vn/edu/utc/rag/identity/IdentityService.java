@@ -12,24 +12,29 @@ import vn.edu.utc.rag.security.*;
 
 @Service
 public class IdentityService {
-  private final Db db;
+
   private final vn.edu.utc.rag.persistence.repository.UsersRepository users;
+
   private final vn.edu.utc.rag.persistence.repository.RoleAssignmentsRepository roles;
+
   private final Access access;
+
   private final PasswordEncoder encoder;
+
   private final RateLimits limits;
+
   private final CsrfTokenRepository csrf;
+
   private final String dummy;
 
   public IdentityService(
-      Db db,
       Access access,
       PasswordEncoder encoder,
       RateLimits limits,
       CsrfTokenRepository csrf,
       vn.edu.utc.rag.persistence.repository.UsersRepository users,
-      vn.edu.utc.rag.persistence.repository.RoleAssignmentsRepository roles) {
-    this.db = db;
+      vn.edu.utc.rag.persistence.repository.RoleAssignmentsRepository roles,
+      vn.edu.utc.rag.persistence.internal.EntityViews views) {
     this.users = users;
     this.roles = roles;
     this.access = access;
@@ -37,6 +42,7 @@ public class IdentityService {
     this.limits = limits;
     this.csrf = csrf;
     dummy = encoder.encode(UUID.randomUUID().toString());
+    this.views = views;
   }
 
   @Transactional
@@ -95,13 +101,12 @@ public class IdentityService {
 
   public Map<String, Object> me(HttpServletRequest req) {
     UUID id = access.requireUser(req);
-    var row = db.one("SELECT id,email,status,created_at FROM users WHERE id=:id", Map.of("id", id));
-    row.put(
-        "roles",
-        db.list(
-            "SELECT r.id,r.role_code,c.code AS campus_code FROM role_assignments r LEFT JOIN"
-                + " campuses c ON c.id=r.campus_id WHERE r.user_id=:id ORDER BY r.id",
-            Map.of("id", id)));
+    var row =
+        views.project(
+            users.findById(id).orElseThrow(ApiException::missing), "id,email,status,created_at");
+    row.put("roles", roles.findRolesForUser(id));
     return row;
   }
+
+  private final vn.edu.utc.rag.persistence.internal.EntityViews views;
 }

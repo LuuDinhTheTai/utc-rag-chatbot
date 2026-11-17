@@ -6,6 +6,7 @@ import java.util.*;
 @Entity
 @Table(name = "knowledge_documents")
 public class KnowledgeDocumentsEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")

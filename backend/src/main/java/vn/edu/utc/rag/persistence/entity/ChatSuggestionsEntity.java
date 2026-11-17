@@ -6,6 +6,7 @@ import java.util.*;
 @Entity
 @Table(name = "chat_suggestions")
 public class ChatSuggestionsEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")

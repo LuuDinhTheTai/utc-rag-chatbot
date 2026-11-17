@@ -4,7 +4,9 @@ import java.io.Serializable;
 import java.util.*;
 
 public class AdmissionOptionCombinationsEntityId implements Serializable {
+
   public Long optionId;
+
   public Short combinationId;
 
   public AdmissionOptionCombinationsEntityId() {}

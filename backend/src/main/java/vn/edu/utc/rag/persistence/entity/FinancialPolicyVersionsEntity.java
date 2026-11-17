@@ -7,6 +7,7 @@ import java.util.*;
 @Entity
 @Table(name = "financial_policy_versions")
 public class FinancialPolicyVersionsEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")

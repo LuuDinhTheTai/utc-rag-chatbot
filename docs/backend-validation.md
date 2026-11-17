@@ -1,10 +1,14 @@
-# Kiểm tra triển khai backend — 2026-11-16
+# Kiểm tra triển khai backend — 2026-11-17
+
+Refactor kiến trúc: `ArchitectureTest` bảo vệ ranh giới service/repository;
+không còn `Db`, `JpaStore`, `SqlWrite`. Backend đã build lại và đạt trạng thái
+healthy trên Docker. Chi tiết: [backend persistence](backend-persistence.md).
 
 - Docker build Java 21 / Spring Boot 3.5.7 thành công.
-- JUnit: **18 tests, 0 failures, 0 errors, 0 skipped**.
+- JUnit: **22 tests, 0 failures, 0 errors, 0 skipped**.
 - 11 tests tích hợp MockMvc chạy trên PostgreSQL/pgvector thật trong database
   `utc_rag_backend_test_<random>` riêng; runner đã xóa database kiểm thử.
-- 7 tests unit/contract kiểm tra Ollama HTTP client, kiểu JSON và đối chiếu
+- 11 tests unit/contract/architecture kiểm tra Ollama HTTP client, kiểu JSON và đối chiếu
   **112 thao tác / 84 đường dẫn** với OpenAPI trong repository.
 - HTTP runtime: frontend 200, backend readiness 200/UP, OpenAPI 200;
   cookie phiên có tên UTC_SESSION, thao tác ghi thiếu CSRF trả 403 CSRF_INVALID.

@@ -4,4 +4,8 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import vn.edu.utc.rag.persistence.entity.*;
 
 public interface PersonalityProfilesRepository
-    extends JpaRepository<PersonalityProfilesEntity, Long> {}
+    extends JpaRepository<PersonalityProfilesEntity, Long> {
+
+  java.util.List<PersonalityProfilesEntity> findAllByQuestionnaireVersionIdOrderByProfileCodeAsc(
+      Long v);
+}

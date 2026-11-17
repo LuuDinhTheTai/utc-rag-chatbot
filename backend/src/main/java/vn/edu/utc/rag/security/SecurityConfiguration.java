@@ -11,6 +11,7 @@ import vn.edu.utc.rag.common.Problems;
 
 @Configuration
 public class SecurityConfiguration {
+
   @Bean
   PasswordEncoder passwordEncoder() {
     return new BCryptPasswordEncoder(12);

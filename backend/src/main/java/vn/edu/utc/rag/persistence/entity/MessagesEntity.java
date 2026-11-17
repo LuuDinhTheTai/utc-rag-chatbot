@@ -1,16 +1,17 @@
 package vn.edu.utc.rag.persistence.entity;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import java.time.Instant;
 import java.util.*;
 
 @Entity
 @Table(name = "messages")
-public class MessagesEntity {
+public class MessagesEntity implements org.springframework.data.domain.Persistable<UUID> {
+
   @Id
-  @GeneratedValue(strategy = GenerationType.UUID)
   @Column(name = "id", columnDefinition = "uuid")
-  private UUID id;
+  private UUID id = UUID.randomUUID();
 
   public UUID getId() {
     return id;
@@ -95,5 +96,19 @@ public class MessagesEntity {
 
   public void setReplyToId(UUID value) {
     this.replyToId = value;
+  }
+
+  @Transient private boolean fresh = true;
+
+  @JsonIgnore
+  @Override
+  public boolean isNew() {
+    return fresh;
+  }
+
+  @PostLoad
+  @PostPersist
+  public void markStored() {
+    fresh = false;
   }
 }

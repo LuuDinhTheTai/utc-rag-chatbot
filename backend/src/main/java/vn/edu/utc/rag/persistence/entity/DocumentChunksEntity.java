@@ -2,12 +2,14 @@ package vn.edu.utc.rag.persistence.entity;
 
 import jakarta.persistence.*;
 import java.util.*;
+import org.hibernate.annotations.Array;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
 @Entity
 @Table(name = "document_chunks")
 public class DocumentChunksEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")
@@ -66,7 +68,7 @@ public class DocumentChunksEntity {
   }
 
   @JdbcTypeCode(SqlTypes.VECTOR)
-  @org.hibernate.annotations.Array(length = 768)
+  @Array(length = 768)
   @Column(name = "embedding", columnDefinition = "vector(768)")
   private float[] embedding;
 

@@ -7,6 +7,7 @@ import java.util.*;
 @Table(name = "personality_answers")
 @IdClass(PersonalityAnswersEntityId.class)
 public class PersonalityAnswersEntity {
+
   @Id
   @Column(name = "attempt_id", columnDefinition = "uuid")
   private UUID attemptId;

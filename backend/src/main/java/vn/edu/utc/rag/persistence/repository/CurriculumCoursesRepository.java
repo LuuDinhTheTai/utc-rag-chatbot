@@ -4,4 +4,9 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import vn.edu.utc.rag.persistence.entity.*;
 
 public interface CurriculumCoursesRepository
-    extends JpaRepository<CurriculumCoursesEntity, CurriculumCoursesEntityId> {}
+    extends JpaRepository<CurriculumCoursesEntity, CurriculumCoursesEntityId> {
+
+  int deleteByCurriculumVersionId(Long v);
+
+  java.util.List<CurriculumCoursesEntity> findAllByCurriculumVersionIdOrderByCourseIdAsc(Long v);
+}

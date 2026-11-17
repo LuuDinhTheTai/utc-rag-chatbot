@@ -7,53 +7,46 @@ import vn.edu.utc.rag.common.*;
 
 @Component
 public class Permissions {
-  private final Db db;
+  private final vn.edu.utc.rag.persistence.repository.RoleAssignmentsRepository repository;
+
   private final Access access;
 
-  public Permissions(Db db, Access access) {
-    this.db = db;
+  public Permissions(
+      Access access, vn.edu.utc.rag.persistence.repository.RoleAssignmentsRepository repository) {
     this.access = access;
+    this.repository = repository;
   }
 
   public UUID check(HttpServletRequest req, Object campus, String... roles) {
     UUID user = access.requireUser(req);
-    var assignments =
-        db.list(
-            "SELECT role_code,campus_id FROM role_assignments WHERE user_id=:id",
-            Map.of("id", user));
+    var assignments = repository.findAllByUserId(user);
     var matching =
-        assignments.stream()
-            .filter(r -> Arrays.asList(roles).contains(r.get("role_code")))
-            .toList();
+        assignments.stream().filter(r -> Arrays.asList(roles).contains(r.getRoleCode())).toList();
     if (matching.isEmpty())
       throw new ApiException(403, "ROLE_REQUIRED", "Required role is missing.");
     if (matching.stream()
         .noneMatch(
             r ->
-                r.get("campus_id") == null
-                    || (campus != null && r.get("campus_id").toString().equals(campus.toString()))))
+                r.getCampusId() == null
+                    || (campus != null && r.getCampusId().toString().equals(campus.toString()))))
       throw ApiException.missing();
     return user;
   }
 
-  public String campusFilter(HttpServletRequest req, String column, String... roles) {
+  public vn.edu.utc.rag.persistence.query.CampusScope campusScope(
+      HttpServletRequest req, String... roles) {
     UUID user = access.requireUser(req);
     var rows =
-        db
-            .list(
-                "SELECT campus_id,role_code FROM role_assignments WHERE user_id=:id",
-                Map.of("id", user))
-            .stream()
-            .filter(r -> Arrays.asList(roles).contains(r.get("role_code")))
+        repository.findAllByUserId(user).stream()
+            .filter(r -> Arrays.asList(roles).contains(r.getRoleCode()))
             .toList();
     if (rows.isEmpty()) throw new ApiException(403, "ROLE_REQUIRED", "Required role is missing.");
-    if (rows.stream().anyMatch(r -> r.get("campus_id") == null)) return "true";
-    return column
-        + " IN ("
-        + rows.stream()
-            .map(r -> Long.toString(Long.parseLong(r.get("campus_id").toString())))
-            .distinct()
-            .collect(java.util.stream.Collectors.joining(","))
-        + ")";
+    if (rows.stream().anyMatch(r -> r.getCampusId() == null))
+      return new vn.edu.utc.rag.persistence.query.CampusScope(true, Set.of());
+    return new vn.edu.utc.rag.persistence.query.CampusScope(
+        false,
+        rows.stream()
+            .map(r -> Short.valueOf(r.getCampusId().toString()))
+            .collect(java.util.stream.Collectors.toSet()));
   }
 }

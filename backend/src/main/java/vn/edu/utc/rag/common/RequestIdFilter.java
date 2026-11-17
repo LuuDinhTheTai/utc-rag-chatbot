@@ -13,6 +13,7 @@ import org.springframework.web.filter.OncePerRequestFilter;
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE)
 public class RequestIdFilter extends OncePerRequestFilter {
+
   @Override
   protected void doFilterInternal(
       HttpServletRequest req, HttpServletResponse res, FilterChain chain)

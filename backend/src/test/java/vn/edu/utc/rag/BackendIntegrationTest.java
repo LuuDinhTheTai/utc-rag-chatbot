@@ -35,7 +35,7 @@ import vn.edu.utc.rag.security.Access;
 class BackendIntegrationTest {
   @Autowired MockMvc mvc;
   @Autowired ObjectMapper json;
-  @Autowired Db db;
+  @Autowired vn.edu.utc.rag.persistence.internal.NativeSqlExecutor db;
   @MockitoBean OllamaClient ai;
   MockHttpSession staff;
   MockHttpSession student;
@@ -532,6 +532,25 @@ class BackendIntegrationTest {
       put(path + "/versions/" + v, draft(root.getKey()), staff, "\"version-0\"", 200);
       put(path + "/versions/" + v, draft(root.getKey()), staff, "\"version-0\"", 412);
       put(path + "/publication", Map.of("version_id", v), staff, "\"publication-0\"", 200);
+      // Flush and reload to verify dirty checking rather than the managed entity's state.
+      entityManager.flush();
+      entityManager.clear();
+      assertThat(get(path + "/versions/" + v, staff, 200).path("status").asText())
+          .isEqualTo("PUBLISHED");
+      String replacement =
+          post(path + "/versions", draft(root.getKey()), staff, 201).get("id").asText();
+      put(
+          path + "/publication",
+          Map.of("version_id", replacement),
+          staff,
+          "\"publication-1\"",
+          200);
+      entityManager.flush();
+      entityManager.clear();
+      assertThat(get(path + "/versions/" + v, staff, 200).path("status").asText())
+          .isEqualTo("ARCHIVED");
+      assertThat(get(path + "/versions/" + replacement, staff, 200).path("status").asText())
+          .isEqualTo("PUBLISHED");
     }
     var cycles = get("/admission-cycles?campus_code=TEST_HN&year=2026", student, 200);
     String cycle = roots.get("admission-cycles");

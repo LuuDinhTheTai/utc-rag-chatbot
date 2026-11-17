@@ -4,7 +4,9 @@ import java.io.Serializable;
 import java.util.*;
 
 public class CombinationSubjectsEntityId implements Serializable {
+
   public Short combinationId;
+
   public String subjectCode;
 
   public CombinationSubjectsEntityId() {}

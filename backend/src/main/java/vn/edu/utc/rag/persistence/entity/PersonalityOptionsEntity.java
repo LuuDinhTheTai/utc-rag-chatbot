@@ -8,6 +8,7 @@ import org.hibernate.type.SqlTypes;
 @Entity
 @Table(name = "personality_options")
 public class PersonalityOptionsEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")

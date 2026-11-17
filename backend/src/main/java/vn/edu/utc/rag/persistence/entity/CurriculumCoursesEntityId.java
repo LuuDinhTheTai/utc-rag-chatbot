@@ -4,7 +4,9 @@ import java.io.Serializable;
 import java.util.*;
 
 public class CurriculumCoursesEntityId implements Serializable {
+
   public Long curriculumVersionId;
+
   public Long courseId;
 
   public CurriculumCoursesEntityId() {}

@@ -7,6 +7,7 @@ import java.util.*;
 @Table(name = "message_citations")
 @IdClass(MessageCitationsEntityId.class)
 public class MessageCitationsEntity {
+
   @Id
   @Column(name = "message_id", columnDefinition = "uuid")
   private UUID messageId;

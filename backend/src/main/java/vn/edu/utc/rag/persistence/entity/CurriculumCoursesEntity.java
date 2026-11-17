@@ -7,6 +7,7 @@ import java.util.*;
 @Table(name = "curriculum_courses")
 @IdClass(CurriculumCoursesEntityId.class)
 public class CurriculumCoursesEntity {
+
   @Id
   @Column(name = "curriculum_version_id", columnDefinition = "bigint")
   private Long curriculumVersionId;

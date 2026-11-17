@@ -1,4 +1,4 @@
-package vn.edu.utc.rag.common;
+package vn.edu.utc.rag.persistence.internal;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManager;
@@ -9,14 +9,17 @@ import org.hibernate.query.NativeQuery;
 import org.postgresql.util.PGobject;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
+import vn.edu.utc.rag.common.ApiException;
 
 @Repository
 @Transactional
-public class Db {
+public class NativeSqlExecutor {
+
   private final EntityManager em;
+
   public final ObjectMapper json;
 
-  public Db(EntityManager em, ObjectMapper json) {
+  public NativeSqlExecutor(EntityManager em, ObjectMapper json) {
     this.em = em;
     this.json = json;
   }
@@ -81,9 +84,9 @@ public class Db {
     var query = em.createNativeQuery(sql);
     args.forEach(query::setParameter);
     int count = query.executeUpdate();
-    em
-        .clear(); // Native mutations must not leave managed entities with stale auth/publication
-                  // state.
+    // Native mutations must not leave managed entities with stale auth/publication
+    em.clear();
+    // state.
     return count;
   }
 
@@ -98,18 +101,5 @@ public class Db {
     } catch (Exception e) {
       throw new IllegalArgumentException("Invalid JSON");
     }
-  }
-
-  public void audit(UUID actor, String action, String type, Object key, Object details) {
-    var args = new HashMap<String, Object>();
-    args.put("actor", actor);
-    args.put("action", action);
-    args.put("type", type);
-    args.put("key", key.toString());
-    args.put("details", encode(details));
-    update(
-        "INSERT INTO audit_events(actor_user_id,action,entity_type,entity_key,details,created_at)"
-            + " VALUES(:actor,:action,:type,:key,CAST(:details AS jsonb),now())",
-        args);
   }
 }

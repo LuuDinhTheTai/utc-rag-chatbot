@@ -7,6 +7,7 @@ import java.util.*;
 @Entity
 @Table(name = "document_revisions")
 public class DocumentRevisionsEntity {
+
   @Id
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   @Column(name = "id", columnDefinition = "bigint")

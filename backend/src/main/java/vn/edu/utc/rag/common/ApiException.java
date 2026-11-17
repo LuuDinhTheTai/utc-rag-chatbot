@@ -1,7 +1,9 @@
 package vn.edu.utc.rag.common;
 
 public class ApiException extends RuntimeException {
+
   public final int status;
+
   public final String code;
 
   public ApiException(int status, String code, String message) {

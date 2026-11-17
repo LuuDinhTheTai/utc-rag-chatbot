@@ -4,7 +4,9 @@ import java.io.Serializable;
 import java.util.*;
 
 public class PersonalityAnswersEntityId implements Serializable {
+
   public UUID attemptId;
+
   public Long questionId;
 
   public PersonalityAnswersEntityId() {}

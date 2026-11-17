@@ -9,7 +9,9 @@ import vn.edu.utc.rag.common.*;
 
 @Component
 public class OllamaClient {
+
   private final RestClient client;
+
   private final OllamaProperties properties;
 
   public OllamaClient(OllamaProperties properties) {

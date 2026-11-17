@@ -8,6 +8,7 @@ import java.util.*;
 @Table(name = "profile_program_recommendations")
 @IdClass(ProfileProgramRecommendationsEntityId.class)
 public class ProfileProgramRecommendationsEntity {
+
   @Id
   @Column(name = "profile_id", columnDefinition = "bigint")
   private Long profileId;
