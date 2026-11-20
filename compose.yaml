@@ -53,21 +53,49 @@ services:
   tools:
     build: ./tools
     environment:
-      POSTGRES_HOST: database
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-utc_rag}
-      POSTGRES_USER: ${POSTGRES_USER:-utc}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      # Database Configuration
+      DATABASE_HOST: database
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${POSTGRES_DB:-utc_rag}
+      DATABASE_USER: ${POSTGRES_WORKER_USER:-utc}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DATABASE_POOL_SIZE: "5"
+      DATABASE_MAX_OVERFLOW: "10"
+      DATABASE_TIMEOUT_SECONDS: "30"
+      DATABASE_MAX_WAITING: "10"
+      
+      # Ollama Configuration
       OLLAMA_BASE_URL: http://ai:11434
-      SLM_MODEL: ${SLM_MODEL:-qwen3:0.6b}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-embeddinggemma:300m-qat-q4_0}
       EMBEDDING_DIMENSION: "768"
-      UTC_SOURCE_URL: ${UTC_SOURCE_URL:-https://tuyensinh.utc.edu.vn}
+      OLLAMA_TIMEOUT_SECONDS: "120"
+      
+      # Crawler Configuration
+      USER_AGENT: "UTC-RAG-Crawler/1.0"
+      MAX_RETRIES: "3"
+      REQUEST_TIMEOUT_SECONDS: "30"
+      DEFAULT_RATE_LIMIT_SECONDS: "2.0"
+      MAX_CONTENT_SIZE_MB: "50"
+      RESPECT_ROBOTS_TXT: "true"
+      
+      # Worker Configuration
+      JOB_CLAIM_TIMEOUT_SECONDS: "10"
+      HEARTBEAT_INTERVAL_SECONDS: "180"
+      LEASE_DURATION_SECONDS: "600"
+      MAX_CLAIM_WAIT_SECONDS: "30"
+      
     depends_on:
       database:
         condition: service_healthy
       ai:
         condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import psycopg; conn = psycopg.connect(host=\"database\", port=5432, dbname=\"${POSTGRES_DB:-utc_rag}\", user=\"${POSTGRES_WORKER_USER:-utc}\", password=\"${POSTGRES_PASSWORD}\"); conn.close()' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     networks: [utc]
 
   database:
