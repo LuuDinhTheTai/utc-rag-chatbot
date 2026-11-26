@@ -50,8 +50,10 @@ services:
       start_period: 20s
     networks: [utc]
 
-  tools:
+  # Crawler worker - processes crawl jobs from queue
+  crawler-worker:
     build: ./tools
+    command: ["python", "-m", "src.main"]
     environment:
       # Database Configuration
       DATABASE_HOST: database
@@ -88,6 +90,34 @@ services:
       database:
         condition: service_healthy
       ai:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import psycopg; conn = psycopg.connect(host=\"database\", port=5432, dbname=\"${POSTGRES_DB:-utc_rag}\", user=\"${POSTGRES_WORKER_USER:-utc}\", password=\"${POSTGRES_PASSWORD}\"); conn.close()' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks: [utc]
+
+  # Crawler scheduler - creates jobs periodically for enabled sources
+  crawler-scheduler:
+    build: ./tools
+    command: ["python", "-m", "src.scheduler"]
+    environment:
+      # Database Configuration (scheduler only needs database, not Ollama)
+      DATABASE_HOST: database
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${POSTGRES_DB:-utc_rag}
+      DATABASE_USER: ${POSTGRES_WORKER_USER:-utc}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DATABASE_POOL_SIZE: "2"
+      DATABASE_MAX_OVERFLOW: "2"
+      DATABASE_TIMEOUT_SECONDS: "30"
+      DATABASE_MAX_WAITING: "5"
+      
+    depends_on:
+      database:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
