@@ -1,19 +1,28 @@
 """Custom exceptions for UTC Crawler.
 
-Provides specific exception types for different failure scenarios.
+Exception taxonomy (used by the worker to decide what to do with a job):
+
+* ``OwnershipLostError`` (``LeaseExpiredError``, ``ClaimTokenMismatchError``,
+  ``JobStateError``): the worker no longer owns the job. It must stop at once and
+  must NOT touch the job row again.
+* ``ShutdownRequested``: graceful shutdown; the job is released back to the queue.
+* ``PermanentJobError``: the job can never succeed as configured (missing source,
+  invalid regex...). The job is failed without retry.
+* ``DiscoveryError``: the website could not be discovered (unreachable, robots
+  unavailable...). Retryable.
+* URL-level errors (``HTTPError``, ``ParsingError``, ``SecurityError``...) are
+  isolated to a single URL and recorded in the crawl report.
+* Infrastructure errors (``DatabaseError``, ``EmbeddingError``) abort the job and
+  are retried according to the retry policy.
 """
 
 
 class CrawlerException(Exception):
     """Base exception for all crawler-related errors."""
 
-    pass
-
 
 class ConfigurationError(CrawlerException):
     """Configuration is invalid or missing required values."""
-
-    pass
 
 
 class HTTPError(CrawlerException):
@@ -24,68 +33,79 @@ class HTTPError(CrawlerException):
         self.url = url
         super().__init__(f"HTTP {status_code}: {message} ({url})")
 
+    @property
+    def is_transient(self) -> bool:
+        """True for errors that may succeed on a later attempt."""
+        return self.status_code in (408, 425, 429, 500, 502, 503, 504) or self.status_code == 0
+
 
 class ContentTooLargeError(CrawlerException):
     """Content exceeds size limit."""
-
-    pass
 
 
 class UnsupportedContentTypeError(CrawlerException):
     """Content type is not supported."""
 
-    pass
-
 
 class ParsingError(CrawlerException):
     """Failed to parse document content."""
 
-    pass
+
+class EmptyContentError(ParsingError):
+    """Document parsed successfully but contains no indexable text."""
 
 
 class RobotsDisallowedError(CrawlerException):
     """URL disallowed by robots.txt."""
 
-    pass
+
+class RobotsUnavailableError(CrawlerException):
+    """robots.txt could not be fetched (5xx / network). Per RFC 9309 crawling must stop."""
 
 
-class LeaseExpiredError(CrawlerException):
+class OwnershipLostError(CrawlerException):
+    """Base class: worker no longer owns the job."""
+
+
+class LeaseExpiredError(OwnershipLostError):
     """Job lease expired, worker no longer owns the job."""
 
-    pass
 
-
-class ClaimTokenMismatchError(CrawlerException):
+class ClaimTokenMismatchError(OwnershipLostError):
     """Claim token does not match expected value."""
 
-    pass
+
+class JobStateError(OwnershipLostError):
+    """Job is not in RUNNING state any more (completed, failed or reset)."""
+
+
+class ShutdownRequested(CrawlerException):
+    """Worker received a shutdown signal while processing a job."""
+
+
+class PermanentJobError(CrawlerException):
+    """Job can never succeed with the current configuration; do not retry."""
+
+
+class DiscoveryError(CrawlerException):
+    """URL discovery failed (site unreachable, sitemap and homepage both failed)."""
 
 
 class ChunkCountMismatchError(CrawlerException):
     """Chunk count verification failed."""
 
-    pass
-
 
 class DatabaseError(CrawlerException):
     """Database operation failed."""
-
-    pass
 
 
 class EmbeddingError(CrawlerException):
     """Ollama embedding generation failed."""
 
-    pass
-
 
 class ValidationError(CrawlerException):
     """Validation failed (URL, content, format, etc.)."""
 
-    pass
-
 
 class SecurityError(CrawlerException):
     """Security validation failed (SSRF, private IP, etc.)."""
-
-    pass

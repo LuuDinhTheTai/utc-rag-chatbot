@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""
-Scheduler entry point - runs the automatic job scheduler.
+"""Scheduler entry point — runs the automatic job scheduler."""
 
-This scheduler creates crawl jobs periodically for enabled sources,
-eliminating the need for manual job creation.
-"""
-
-import sys
 import os
+import sys
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+# Ensure tools/ is on sys.path so `src.scheduler` resolves cleanly
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.scheduler import main
 

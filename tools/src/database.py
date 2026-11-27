@@ -1,19 +1,42 @@
 """Database connection and query management.
 
-Provides PostgreSQL connection pool and transaction handling using psycopg3.
+Provides a PostgreSQL connection pool and transaction handling using psycopg3.
+
+Rules:
+* Any operation that must be atomic (ownership check + write) MUST be performed
+  inside a single ``transaction()`` block and use the yielded connection. The
+  helpers ``execute`` / ``execute_one`` each borrow their own connection and
+  commit immediately; they must never be used to "protect" a later statement.
+* Domain exceptions (``CrawlerException`` subclasses such as
+  ``LeaseExpiredError``) raised inside a transaction are re-raised unchanged after
+  rollback, so callers can distinguish lost ownership from database failures.
+* SQL parameters are never logged (they may contain document content or tokens).
 """
 
 import logging
-from typing import Any, Optional, Dict, List
 from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Sequence, Union
+
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+try:
+    from pgvector.psycopg import register_vector
+except ImportError:  # pragma: no cover - verified at runtime on connect()
+    register_vector = None
+
 from .config import DatabaseConfig
-from .exceptions import DatabaseError
+from .exceptions import CrawlerException, DatabaseError
 
 logger = logging.getLogger(__name__)
+
+Params = Optional[Union[Dict[str, Any], Sequence[Any]]]
+
+
+def _short(query: str, limit: int = 200) -> str:
+    compact = " ".join(query.split())
+    return compact if len(compact) <= limit else compact[:limit] + "..."
 
 
 class Database:
@@ -22,190 +45,143 @@ class Database:
     def __init__(
         self,
         config: DatabaseConfig,
-        min_size: int = 2,
-        max_size: int = 10,
-        timeout: float = 30.0,
-        max_waiting: int = 0,
+        min_size: Optional[int] = None,
+        max_size: Optional[int] = None,
+        timeout: Optional[float] = None,
+        max_waiting: Optional[int] = None,
     ):
-        """Initialize database connection pool.
-
-        Args:
-            config: Database configuration
-            min_size: Minimum pool size
-            max_size: Maximum pool size
-            timeout: Connection timeout in seconds
-            max_waiting: Maximum number of requests waiting for a connection (0 = unlimited)
-        """
+        """Initialize database connection pool settings (pool opens on ``connect``)."""
         self.config = config
         self.pool: Optional[ConnectionPool] = None
-        self.min_size = min_size
-        self.max_size = max_size
-        self.timeout = timeout
-        self.max_waiting = max_waiting
+        self.min_size = config.pool_min_size if min_size is None else min_size
+        self.max_size = config.pool_max_size if max_size is None else max_size
+        self.timeout = config.pool_timeout_seconds if timeout is None else timeout
+        self.max_waiting = config.pool_max_waiting if max_waiting is None else max_waiting
+
+        if self.min_size < 0 or self.max_size < 1 or self.min_size > self.max_size:
+            raise ValueError(
+                f"Invalid pool size: min={self.min_size}, max={self.max_size}"
+            )
+        if self.timeout <= 0:
+            raise ValueError("Pool timeout must be > 0")
+
+    @staticmethod
+    def _configure_connection(conn: psycopg.Connection) -> None:
+        """Register pgvector adapter on every pooled connection (for both INSERT and SELECT)."""
+        if register_vector is None:
+            raise DatabaseError(
+                "pgvector package is not installed; install pgvector to support vector(768) columns"
+            )
+        register_vector(conn)
 
     def connect(self) -> None:
-        """Initialize connection pool.
+        """Initialize connection pool and verify connectivity.
 
         Raises:
-            DatabaseError: If connection fails
+            DatabaseError: If connection fails (the pool is closed again).
         """
+        if self.pool is not None:
+            return
+        logger.info(
+            "Connecting to PostgreSQL at %s:%s/%s as %s",
+            self.config.host, self.config.port, self.config.database, self.config.user,
+        )
+        pool = ConnectionPool(
+            conninfo=self.config.connection_string,
+            min_size=self.min_size,
+            max_size=self.max_size,
+            timeout=self.timeout,
+            max_waiting=self.max_waiting,
+            kwargs={"row_factory": dict_row},
+            configure=self._configure_connection,
+            open=False,
+        )
         try:
-            logger.info(
-                f"Connecting to PostgreSQL at {self.config.host}:{self.config.port}/{self.config.database}"
-            )
-
-            self.pool = ConnectionPool(
-                conninfo=self.config.connection_string,
-                min_size=self.min_size,
-                max_size=self.max_size,
-                timeout=self.timeout,
-                max_waiting=self.max_waiting,
-                kwargs={"row_factory": dict_row},
-                open=True,
-            )
-
-            # Test connection
-            with self.pool.connection() as conn:
-                result = conn.execute("SELECT version()").fetchone()
-                logger.info(f"Connected to PostgreSQL: {result['version'][:50]}...")
-
+            pool.open(wait=False)
+            with pool.connection(timeout=self.timeout) as conn:
+                row = conn.execute("SELECT version() AS version, current_user AS usr").fetchone()
+                logger.info("Connected to PostgreSQL as %s: %s", row["usr"], row["version"][:60])
         except Exception as e:
+            pool.close()
             raise DatabaseError(f"Failed to connect to database: {e}") from e
+        self.pool = pool
 
     def close(self) -> None:
-        """Close connection pool."""
-        if self.pool:
+        """Close connection pool (idempotent)."""
+        pool, self.pool = self.pool, None
+        if pool is not None:
             logger.info("Closing database connection pool")
-            self.pool.close()
-            self.pool = None
+            pool.close()
 
     @contextmanager
     def connection(self):
-        """Get a connection from the pool.
-
-        Yields:
-            psycopg.Connection
-
-        Raises:
-            DatabaseError: If pool not initialized
-        """
+        """Borrow a connection from the pool (commits on success, rolls back on error)."""
         if not self.pool:
             raise DatabaseError("Database pool not initialized. Call connect() first.")
-
-        with self.pool.connection() as conn:
-            try:
+        try:
+            with self.pool.connection() as conn:
                 yield conn
-            except Exception as e:
-                logger.error(f"Database connection error: {e}")
-                raise DatabaseError(f"Connection error: {e}") from e
+        except CrawlerException:
+            raise
+        except psycopg.Error as e:
+            raise DatabaseError(f"Database error: {e}") from e
 
     @contextmanager
     def transaction(self):
-        """Get a connection with transaction context.
+        """Yield a connection inside one explicit transaction.
 
-        Automatically commits on success, rolls back on exception.
-
-        Yields:
-            psycopg.Connection
-
-        Raises:
-            DatabaseError: If transaction fails
+        Commits on success, rolls back on any exception. Domain exceptions are
+        re-raised unchanged; driver errors are wrapped in ``DatabaseError``.
         """
         with self.connection() as conn:
             try:
                 with conn.transaction():
                     yield conn
-            except Exception as e:
-                logger.error(f"Transaction failed: {e}")
+            except CrawlerException:
+                raise
+            except psycopg.Error as e:
+                logger.error("Transaction rolled back: %s", e)
                 raise DatabaseError(f"Transaction error: {e}") from e
 
-    def execute(
-        self, query: str, params: Optional[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
-        """Execute query and return all results.
-
-        Args:
-            query: SQL query
-            params: Query parameters
-
-        Returns:
-            List of result rows as dicts
-
-        Raises:
-            DatabaseError: If query fails
-        """
+    def execute(self, query: str, params: Params = None) -> List[Dict[str, Any]]:
+        """Execute a query in its own short transaction and return all rows."""
         try:
             with self.connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(query, params or {})
-                    if cur.description:  # Has results
-                        return cur.fetchall()
-                    return []
-        except Exception as e:
-            logger.error(f"Query failed: {e}\nQuery: {query}\nParams: {params}")
-            raise DatabaseError(f"Query failed: {e}") from e
+                    cur.execute(query, params)
+                    return cur.fetchall() if cur.description else []
+        except DatabaseError:
+            logger.error("Query failed: %s", _short(query))
+            raise
 
-    def execute_one(
-        self, query: str, params: Optional[Dict[str, Any]] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Execute query and return single result.
-
-        Args:
-            query: SQL query
-            params: Query parameters
-
-        Returns:
-            Single result row as dict, or None
-
-        Raises:
-            DatabaseError: If query fails
-        """
+    def execute_one(self, query: str, params: Params = None) -> Optional[Dict[str, Any]]:
+        """Execute a query in its own short transaction and return the first row."""
         try:
             with self.connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(query, params or {})
-                    if cur.description:
-                        return cur.fetchone()
-                    return None
-        except Exception as e:
-            logger.error(f"Query failed: {e}\nQuery: {query}\nParams: {params}")
-            raise DatabaseError(f"Query failed: {e}") from e
+                    cur.execute(query, params)
+                    return cur.fetchone() if cur.description else None
+        except DatabaseError:
+            logger.error("Query failed: %s", _short(query))
+            raise
 
-    def execute_many(
-        self, query: str, params_list: List[Dict[str, Any]]
-    ) -> None:
-        """Execute query multiple times with different parameters.
-
-        Uses executemany for efficiency when inserting multiple rows.
-
-        Args:
-            query: SQL query with named placeholders
-            params_list: List of parameter dicts
-
-        Raises:
-            DatabaseError: If query fails
-        """
+    def execute_batch(self, query: str, params_list: List[Dict[str, Any]]) -> None:
+        """Execute a statement for many parameter sets in one transaction."""
         if not params_list:
             return
-
         try:
-            with self.connection() as conn:
+            with self.transaction() as conn:
                 with conn.cursor() as cur:
-                    # psycopg3 executemany with named parameters
                     cur.executemany(query, params_list)
-        except Exception as e:
-            logger.error(f"Batch query failed: {e}\nQuery: {query}")
-            raise DatabaseError(f"Batch query failed: {e}") from e
+        except DatabaseError:
+            logger.error("Batch query failed: %s", _short(query))
+            raise
 
     def health_check(self) -> bool:
-        """Check if database is accessible.
-
-        Returns:
-            True if healthy, False otherwise
-        """
+        """Return True if the database answers a trivial query."""
         try:
-            result = self.execute_one("SELECT 1 as health")
+            result = self.execute_one("SELECT 1 AS health")
             return result is not None and result.get("health") == 1
         except Exception as e:
-            logger.error(f"Health check failed: {e}")
+            logger.error("Health check failed: %s", e)
             return False

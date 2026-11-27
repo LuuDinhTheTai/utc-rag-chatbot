@@ -1,255 +1,271 @@
-"""
-Worker entry point - Phase 3 crawler worker.
-
-Implements main worker loop:
-- Claim jobs from queue
-- Process each job (crawl source)
-- Send heartbeats
-- Handle graceful shutdown
-"""
+"""Worker entry point — claims crawl jobs, maintains time-based leases, and runs ingestion."""
 
 import logging
 import signal
-import time
 import sys
+import threading
+import time
 from typing import Optional
 
-from .config import CrawlerConfig
-from .database import Database
-from .job_manager import JobManager
-from .revision_processor import RevisionProcessor
-from .crawler import CrawlEngine
-from .embedder import OllamaEmbedder
 from .chunker import Chunker
+from .config import Config, load_config, touch_liveness
+from .crawler import CrawlEngine
+from .database import Database
+from .embedder import OllamaEmbedder
+from .exceptions import (
+    DiscoveryError,
+    OwnershipLostError,
+    PermanentJobError,
+    ShutdownRequested,
+    ValidationError,
+)
+from .job_context import JobContext, LeaseKeeper
+from .job_manager import JobManager, RetryPolicy
+from .revision_processor import RevisionProcessor
 from .source_registry import SourceRegistry
-from .exceptions import LeaseExpiredError, ClaimTokenMismatchError
-
 
 logger = logging.getLogger(__name__)
 
 
 class Worker:
-    """Crawler worker that processes jobs from queue."""
-    
-    def __init__(self, config: CrawlerConfig):
-        """
-        Initialize worker.
-        
-        Args:
-            config: Crawler configuration
-        """
+    """Crawler worker that claims and processes jobs from PostgreSQL."""
+
+    def __init__(self, config: Config, register_signals: bool = True):
         self.config = config
-        self.stopped = False
-        
-        # Initialize components
-        self.database = Database(config)
-        self.job_manager = JobManager(self.database, config)
-        
-        # Initialize embedder and chunker
-        self.embedder = OllamaEmbedder(
-            base_url=config.ollama_base_url,
-            model=config.embedding_model,
-            expected_dimension=config.embedding_dimension,
+        self._stop_event = threading.Event()
+
+        self.database = Database(config.database)
+        retry_policy = RetryPolicy(
+            max_attempts=config.worker.max_attempts,
+            base_delay_seconds=config.worker.retry_base_delay_seconds,
+            max_delay_seconds=config.worker.retry_max_delay_seconds,
+            jitter_ratio=config.worker.retry_jitter_ratio,
         )
-        self.chunker = Chunker(
-            max_chunk_size=config.chunk_max_size,
-            overlap_size=config.chunk_overlap_size,
+        self.job_manager = JobManager(
+            self.database,
+            lease_duration_seconds=config.worker.lease_duration_seconds,
+            retry_policy=retry_policy,
         )
-        
-        # Initialize revision processor
+        self.source_registry = SourceRegistry(
+            self.database,
+            default_rate_limit_seconds=config.crawler.default_rate_limit_seconds,
+        )
+        self.embedder = OllamaEmbedder(config=config.ollama)
+        self.chunker = Chunker()
         self.revision_processor = RevisionProcessor(
             database=self.database,
             embedder=self.embedder,
+            job_manager=self.job_manager,
+            embedding_model=config.ollama.embedding_model,
             chunker=self.chunker,
-            config=config,
+            auto_publish=config.crawler.auto_publish,
         )
-        
-        # Initialize crawler
         self.crawler = CrawlEngine(
-            config=config,
+            config=config.crawler,
             database=self.database,
             job_manager=self.job_manager,
             revision_processor=self.revision_processor,
         )
-        
-        # Register signal handlers
-        signal.signal(signal.SIGTERM, self._handle_shutdown)
-        signal.signal(signal.SIGINT, self._handle_shutdown)
-    
-    def _handle_shutdown(self, signum, frame):
-        """Handle shutdown signals."""
-        logger.info(f"Received signal {signum}, shutting down gracefully...")
-        self.stopped = True
-    
-    def run(self):
-        """
-        Main worker loop.
-        
-        Continuously claims and processes jobs until stopped.
-        """
-        logger.info("Worker starting...")
-        
-        # Health check
-        if not self.database.health_check():
-            logger.error("Database health check failed")
-            sys.exit(1)
-        
-        if not self.embedder.health_check():
-            logger.error("Embedder health check failed")
-            sys.exit(1)
-        
-        logger.info("Health checks passed")
-        
-        # Main loop
-        idle_count = 0
-        
-        while not self.stopped:
+
+        if register_signals:
             try:
-                # Attempt to claim a job
-                job = self.job_manager.claim_job()
-                
-                if job is None:
-                    # No jobs available
-                    idle_count += 1
-                    
-                    if idle_count == 1:
-                        logger.info("No jobs available, waiting...")
-                    
-                    # Exponential backoff (1s, 2s, 4s, ..., max 30s)
-                    wait_time = min(2 ** (idle_count - 1), 30)
-                    time.sleep(wait_time)
-                    continue
-                
-                # Reset idle count when job claimed
-                idle_count = 0
-                
-                # Process job
-                self._process_job(job)
-                
-            except KeyboardInterrupt:
-                logger.info("Keyboard interrupt received")
-                self.stopped = True
-                break
-            
-            except Exception as e:
-                logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
-                time.sleep(5)  # Brief pause before retrying
-        
-        # Cleanup
-        logger.info("Worker shutting down...")
-        self._cleanup()
-        logger.info("Worker stopped")
-    
-    def _process_job(self, job: dict):
-        """
-        Process a single crawl job.
-        
-        Args:
-            job: Job dictionary with id, source_id, claim_token
-        """
-        job_id = job['id']
-        source_id = job['source_id']
-        claim_token = job['claim_token']
-        
-        logger.info(f"Processing job {job_id} for source {source_id}")
-        
+                signal.signal(signal.SIGTERM, self._handle_shutdown)
+                signal.signal(signal.SIGINT, self._handle_shutdown)
+            except ValueError:
+                pass
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+    @stopped.setter
+    def stopped(self, value: bool) -> None:
+        if value:
+            self._stop_event.set()
+        else:
+            self._stop_event.clear()
+
+    def _handle_shutdown(self, signum, frame) -> None:
+        logger.info("Received signal %s, shutting down gracefully...", signum)
+        self._stop_event.set()
+
+    def run(self) -> None:
+        """Main worker loop. Always cleans up resources even if startup checks fail."""
+        logger.info(
+            "Worker starting (lease=%ss, heartbeat=%ss, max_attempts=%d)...",
+            self.config.worker.lease_duration_seconds,
+            self.config.worker.heartbeat_interval_seconds,
+            self.config.worker.max_attempts,
+        )
+
         try:
-            # Get source configuration
-            source_registry = SourceRegistry(self.database)
-            source = source_registry.get_source_by_id(source_id)
-            
-            if not source:
-                logger.error(f"Source {source_id} not found")
-                self.job_manager.fail_job(
+            self.database.connect()
+
+            if not self.database.health_check():
+                logger.error("Database health check failed")
+                sys.exit(1)
+
+            if not self.embedder.health_check():
+                logger.error("Embedder health check failed")
+                sys.exit(1)
+
+            logger.info("Health checks passed")
+            touch_liveness(self.config.worker.liveness_file)
+
+            idle_count = 0
+            last_reclaim = 0.0
+
+            while not self._stop_event.is_set():
+                try:
+                    now = time.monotonic()
+                    if now - last_reclaim >= self.config.worker.reclaim_interval_seconds:
+                        try:
+                            self.job_manager.reclaim_expired_jobs()
+                        except Exception as e:
+                            logger.warning("Reclaim pass failed: %s", e)
+                        last_reclaim = now
+
+                    job = self.job_manager.claim_job()
+                    touch_liveness(self.config.worker.liveness_file)
+
+                    if job is None:
+                        idle_count += 1
+                        if idle_count == 1:
+                            logger.info("No jobs available, waiting...")
+                        wait_time = min(
+                            2 ** (idle_count - 1),
+                            self.config.worker.idle_poll_max_seconds,
+                        )
+                        self._stop_event.wait(wait_time)
+                        continue
+
+                    idle_count = 0
+                    self._process_job(job)
+
+                except KeyboardInterrupt:
+                    logger.info("Keyboard interrupt received")
+                    self._stop_event.set()
+                    break
+                except Exception as e:
+                    logger.error("Unexpected error in worker loop: %s", e, exc_info=True)
+                    if self._stop_event.wait(5):
+                        break
+        finally:
+            logger.info("Worker shutting down...")
+            self._cleanup()
+            logger.info("Worker stopped")
+
+    def _process_job(self, job: dict) -> None:
+        """Process a single claimed job with a time-based LeaseKeeper."""
+        job_id = job["id"]
+        source_id = job["source_id"]
+        claim_token = job["claim_token"]
+
+        logger.info("Processing job %s for source %s (attempt %s)", job_id, source_id, job.get("attempt_no"))
+
+        ctx = JobContext(job_id=job_id, claim_token=claim_token, stop_event=self._stop_event)
+
+        def on_beat() -> None:
+            touch_liveness(self.config.worker.liveness_file)
+
+        with LeaseKeeper(
+            heartbeat=self.job_manager.heartbeat,
+            context=ctx,
+            interval_seconds=self.config.worker.heartbeat_interval_seconds,
+            lease_duration_seconds=self.config.worker.lease_duration_seconds,
+            on_beat=on_beat,
+        ):
+            try:
+                source = self.source_registry.get_source_by_id(source_id)
+                if not source:
+                    raise PermanentJobError(f"Source {source_id} not found")
+
+                if not source.enabled:
+                    logger.warning("Source %s is disabled; completing job %s without crawling", source_id, job_id)
+                    self.job_manager.complete_job(job_id, claim_token, summary="Source disabled; skipped")
+                    return
+
+                issues = self.source_registry.validate_source_config(source)
+                if issues:
+                    logger.warning("Source %s validation issues: %s", source_id, issues)
+
+                report = self.crawler.crawl_source(source, job_id, claim_token, job_context=ctx)
+
+                # Final checkpoint before completing
+                ctx.checkpoint()
+
+                if report.status == "failed":
+                    # Every discovered URL failed -> do NOT mark job COMPLETED
+                    self.job_manager.fail_job(
+                        job_id,
+                        claim_token,
+                        error_message=report.error_summary or "All discovered URLs failed",
+                        retryable=True,
+                    )
+                    return
+
+                self.job_manager.complete_job(
                     job_id,
                     claim_token,
-                    error_message=f"Source {source_id} not found",
+                    summary=report.error_summary,
                 )
-                return
-            
-            if not source.enabled:
-                logger.warning(f"Source {source_id} is disabled")
-                self.job_manager.complete_job(job_id, claim_token)
-                return
-            
-            # Validate source configuration
-            issues = source_registry.validate_source_config(source)
-            if issues:
-                logger.warning(f"Source {source_id} validation issues: {issues}")
-            
-            # Crawl source
-            results = self.crawler.crawl_source(source, job_id, claim_token)
-            
-            # Log results
-            success_count = sum(1 for r in results if r.success)
-            new_count = sum(1 for r in results if r.status == 'new')
-            changed_count = sum(1 for r in results if r.status == 'changed')
-            unchanged_count = sum(1 for r in results if r.status == 'unchanged')
-            error_count = sum(1 for r in results if not r.success)
-            
-            logger.info(
-                f"Job {job_id} completed: "
-                f"{success_count}/{len(results)} successful, "
-                f"{new_count} new, {changed_count} changed, "
-                f"{unchanged_count} unchanged, {error_count} errors"
-            )
-            
-            # Update source last_crawled timestamp
-            source_registry.update_last_crawled(source_id)
-            
-            # Mark job as complete
-            self.job_manager.complete_job(job_id, claim_token)
-            
-        except (LeaseExpiredError, ClaimTokenMismatchError) as e:
-            logger.error(f"Lost job ownership for job {job_id}: {e}")
-            # Don't try to update job status - we no longer own it
-        
+
+            except OwnershipLostError as e:
+                logger.error("Lost ownership of job %s: %s (not updating job row)", job_id, e)
+
+            except ShutdownRequested:
+                logger.info("Shutdown requested during job %s; releasing job back to queue", job_id)
+                try:
+                    self.job_manager.release_job(job_id, claim_token, reason="worker shutdown")
+                except OwnershipLostError:
+                    logger.warning("Could not release job %s: ownership already lost", job_id)
+                except Exception as release_err:
+                    logger.error("Failed to release job %s: %s", job_id, release_err)
+
+            except (PermanentJobError, ValidationError) as e:
+                logger.error("Job %s failed permanently: %s", job_id, e)
+                self._safe_fail(job_id, claim_token, str(e), retryable=False)
+
+            except DiscoveryError as e:
+                logger.error("Job %s discovery failed: %s", job_id, e)
+                self._safe_fail(job_id, claim_token, f"Discovery failed: {e}", retryable=True)
+
+            except Exception as e:
+                logger.error("Job %s failed: %s", job_id, e, exc_info=True)
+                self._safe_fail(job_id, claim_token, str(e), retryable=True)
+
+    def _safe_fail(self, job_id: int, claim_token, message: str, *, retryable: bool) -> None:
+        try:
+            self.job_manager.fail_job(job_id, claim_token, error_message=message, retryable=retryable)
+        except OwnershipLostError as e:
+            logger.warning("Skipping fail_job for %s: ownership lost (%s)", job_id, e)
         except Exception as e:
-            logger.error(f"Job {job_id} failed: {e}", exc_info=True)
-            
+            logger.error("Failed to mark job %s as failed: %s", job_id, e)
+
+    def _cleanup(self) -> None:
+        for name, obj in (("crawler", self.crawler), ("embedder", self.embedder), ("database", self.database)):
             try:
-                self.job_manager.fail_job(job_id, claim_token, error_message=str(e))
-            except Exception as fail_error:
-                logger.error(f"Failed to mark job as failed: {fail_error}")
-    
-    def _cleanup(self):
-        """Cleanup resources."""
-        try:
-            self.crawler.close()
-        except Exception as e:
-            logger.error(f"Error closing crawler: {e}")
-        
-        try:
-            self.embedder.close()
-        except Exception as e:
-            logger.error(f"Error closing embedder: {e}")
-        
-        try:
-            self.database.close()
-        except Exception as e:
-            logger.error(f"Error closing database: {e}")
+                obj.close()
+            except Exception as e:
+                logger.error("Error closing %s: %s", name, e)
 
 
 def main() -> None:
     """Main worker entry point."""
-    # Configure logging
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    
     logger.info("UTC Crawler Worker starting...")
-    
+
     try:
-        # Load configuration
-        config = CrawlerConfig()
-        
-        # Create and run worker
+        config = load_config()
         worker = Worker(config)
         worker.run()
-        
+    except SystemExit:
+        raise
     except Exception as e:
-        logger.error(f"Worker failed to start: {e}", exc_info=True)
+        logger.error("Worker failed to start: %s", e, exc_info=True)
         sys.exit(1)
 
 

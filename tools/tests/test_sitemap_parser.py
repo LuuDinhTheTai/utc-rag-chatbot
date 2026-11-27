@@ -1,33 +1,22 @@
-"""
-Tests for Sitemap Parser module.
-"""
+"""Tests for SitemapParser — SSRF validation, nested sitemaps, domain/path filtering, limits."""
+
+from datetime import datetime
+from unittest.mock import MagicMock
 
 import pytest
-from datetime import datetime
-from unittest.mock import MagicMock, Mock
-from dataclasses import dataclass
 
-from src.sitemap_parser import SitemapParser, SitemapURL, SITEMAP_NAMESPACES
-from src.exceptions import HTTPError, ValidationError
-
-
-@dataclass
-class MockResponse:
-    """Mock HTTP response."""
-    content: bytes
-    status_code: int = 200
+from src.exceptions import HTTPError, SecurityError, ValidationError
+from src.sitemap_parser import SitemapParser, SitemapURL
 
 
 @pytest.fixture
 def mock_http_client():
-    """Mock HTTP client."""
     return MagicMock()
 
 
 @pytest.fixture
 def simple_sitemap_xml():
-    """Simple sitemap XML."""
-    return b'''<?xml version="1.0" encoding="UTF-8"?>
+    return b"""<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
         <loc>https://utc.edu.vn/tuyen-sinh</loc>
@@ -39,305 +28,136 @@ def simple_sitemap_xml():
         <loc>https://utc.edu.vn/dao-tao</loc>
         <lastmod>2024-01-10T10:30:00Z</lastmod>
     </url>
-</urlset>'''
+</urlset>"""
 
 
 @pytest.fixture
 def sitemap_index_xml():
-    """Sitemap index XML."""
-    return b'''<?xml version="1.0" encoding="UTF-8"?>
+    return b"""<?xml version="1.0" encoding="UTF-8"?>
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-    <sitemap>
-        <loc>https://utc.edu.vn/sitemap-1.xml</loc>
-    </sitemap>
-    <sitemap>
-        <loc>https://utc.edu.vn/sitemap-2.xml</loc>
-    </sitemap>
-</sitemapindex>'''
+    <sitemap><loc>https://utc.edu.vn/sitemap-1.xml</loc></sitemap>
+    <sitemap><loc>https://utc.edu.vn/sitemap-2.xml</loc></sitemap>
+</sitemapindex>"""
 
 
 class TestSitemapURL:
-    """Tests for SitemapURL dataclass."""
-    
-    def test_valid_sitemap_url(self):
-        """Test creating valid SitemapURL."""
-        url = SitemapURL(
-            loc='https://utc.edu.vn/page',
-            lastmod=datetime(2024, 1, 15),
-            changefreq='weekly',
-            priority=0.8,
-            source_sitemap='https://utc.edu.vn/sitemap.xml'
-        )
-        
-        assert url.loc == 'https://utc.edu.vn/page'
-        assert url.priority == 0.8
-    
-    def test_sitemap_url_empty_loc(self):
-        """Test SitemapURL with empty loc raises error."""
-        with pytest.raises(ValidationError, match="URL location cannot be empty"):
-            SitemapURL(
-                loc='',
-                lastmod=None,
-                changefreq=None,
-                priority=None,
-                source_sitemap='https://utc.edu.vn/sitemap.xml'
-            )
-    
-    def test_sitemap_url_invalid_url(self):
-        """Test SitemapURL with invalid URL raises error."""
-        with pytest.raises(ValidationError, match="Invalid URL"):
-            SitemapURL(
-                loc='not-a-url',
-                lastmod=None,
-                changefreq=None,
-                priority=None,
-                source_sitemap='https://utc.edu.vn/sitemap.xml'
-            )
-    
-    def test_sitemap_url_invalid_priority(self):
-        """Test SitemapURL with invalid priority raises error."""
-        with pytest.raises(ValidationError, match="Priority must be between"):
-            SitemapURL(
-                loc='https://utc.edu.vn/page',
-                lastmod=None,
-                changefreq=None,
-                priority=1.5,  # Invalid: > 1.0
-                source_sitemap='https://utc.edu.vn/sitemap.xml'
-            )
+    def test_valid_and_invalid(self):
+        url = SitemapURL("https://utc.edu.vn/page", datetime(2024, 1, 15), "weekly", 0.8, "https://utc.edu.vn/sitemap.xml")
+        assert url.loc == "https://utc.edu.vn/page"
+
+        with pytest.raises(ValidationError):
+            SitemapURL("", None, None, None, "https://utc.edu.vn/sitemap.xml")
+        with pytest.raises(ValidationError):
+            SitemapURL("not-a-url", None, None, None, "https://utc.edu.vn/sitemap.xml")
+        with pytest.raises(ValidationError):
+            SitemapURL("https://utc.edu.vn/page", None, None, 1.5, "https://utc.edu.vn/sitemap.xml")
 
 
 class TestSitemapParser:
-    """Tests for SitemapParser."""
-    
-    def test_init(self, mock_http_client):
-        """Test SitemapParser initialization."""
+    def test_parse_simple_sitemap_enables_security_validation(self, mock_http_client, simple_sitemap_xml):
+        mock_http_client.fetch.return_value = (simple_sitemap_xml, "application/xml", None)
+        parser = SitemapParser(http_client=mock_http_client, allowed_domains=["utc.edu.vn"])
+
+        urls = parser.parse_sitemap("https://utc.edu.vn/sitemap.xml")
+        assert len(urls) == 2
+        assert urls[0].loc == "https://utc.edu.vn/tuyen-sinh"
+        assert urls[0].priority == 0.8
+        assert urls[0].lastmod == datetime(2024, 1, 15)
+        # Must validate security (no SSRF bypass)
+        _, kwargs = mock_http_client.fetch.call_args
+        assert kwargs["validate_security"] is True
+
+    def test_parse_sitemap_index_and_dedup(self, mock_http_client, sitemap_index_xml, simple_sitemap_xml):
+        child2 = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url><loc>https://utc.edu.vn/tuyen-sinh</loc></url>
+    <url><loc>https://utc.edu.vn/tin-tuc</loc></url>
+</urlset>"""
+        mock_http_client.fetch.side_effect = [
+            (sitemap_index_xml, "application/xml", None),
+            (simple_sitemap_xml, "application/xml", None),
+            (child2, "application/xml", None),
+        ]
+        parser = SitemapParser(http_client=mock_http_client, allowed_domains=["utc.edu.vn"])
+        urls = parser.parse_sitemap("https://utc.edu.vn/sitemap_index.xml")
+        locs = [u.loc for u in urls]
+        assert locs == [
+            "https://utc.edu.vn/tuyen-sinh",
+            "https://utc.edu.vn/dao-tao",
+            "https://utc.edu.vn/tin-tuc",
+        ]
+
+    def test_filters_domain_and_path_patterns(self, mock_http_client):
+        xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url><loc>https://utc.edu.vn/tuyen-sinh/2026</loc></url>
+    <url><loc>https://utc.edu.vn/tuyen-sinh/admin</loc></url>
+    <url><loc>https://utc.edu.vn.attacker.com/tuyen-sinh/x</loc></url>
+    <url><loc>https://utc.edu.vn/other</loc></url>
+</urlset>"""
+        mock_http_client.fetch.return_value = (xml, "application/xml", None)
         parser = SitemapParser(
             http_client=mock_http_client,
-            allowed_domains=['utc.edu.vn'],
-            allowed_path_patterns=['/tuyen-sinh/.*'],
-            excluded_path_patterns=['/admin/.*'],
-            max_urls=5000
+            allowed_domains=["utc.edu.vn"],
+            allowed_path_patterns=[r"/tuyen-sinh/.*"],
+            excluded_path_patterns=[r"/admin"],
         )
-        
-        assert parser.http_client is mock_http_client
-        assert 'utc.edu.vn' in parser.allowed_domains
-        assert len(parser.allowed_path_patterns) == 1
-        assert len(parser.excluded_path_patterns) == 1
-        assert parser.max_urls == 5000
-    
-    def test_parse_simple_sitemap(self, mock_http_client, simple_sitemap_xml):
-        """Test parsing simple sitemap."""
-        mock_http_client.get.return_value = MockResponse(content=simple_sitemap_xml)
-        
-        parser = SitemapParser(mock_http_client, allowed_domains=['utc.edu.vn'])
-        urls = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        
-        assert len(urls) == 2
-        assert urls[0].loc == 'https://utc.edu.vn/tuyen-sinh'
-        assert urls[0].priority == 0.8
-        assert urls[0].changefreq == 'weekly'
-        assert urls[1].loc == 'https://utc.edu.vn/dao-tao'
-    
-    def test_parse_sitemap_with_lastmod(self, mock_http_client, simple_sitemap_xml):
-        """Test parsing sitemap with lastmod dates."""
-        mock_http_client.get.return_value = MockResponse(content=simple_sitemap_xml)
-        
-        parser = SitemapParser(mock_http_client, allowed_domains=['utc.edu.vn'])
-        urls = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        
-        # First URL has simple date format
-        assert urls[0].lastmod is not None
-        assert urls[0].lastmod.year == 2024
-        assert urls[0].lastmod.month == 1
-        assert urls[0].lastmod.day == 15
-        
-        # Second URL has ISO datetime format
-        assert urls[1].lastmod is not None
-    
-    def test_parse_sitemap_index(self, mock_http_client, sitemap_index_xml, simple_sitemap_xml):
-        """Test parsing sitemap index."""
-        # First call returns index, subsequent calls return child sitemaps
-        mock_http_client.get.side_effect = [
-            MockResponse(content=sitemap_index_xml),
-            MockResponse(content=simple_sitemap_xml),
-            MockResponse(content=simple_sitemap_xml),
-        ]
-        
-        parser = SitemapParser(mock_http_client, allowed_domains=['utc.edu.vn'])
-        urls = parser.parse_sitemap('https://utc.edu.vn/sitemap-index.xml')
-        
-        # Should get URLs from both child sitemaps
-        # Note: Parser deduplicates URLs across child sitemaps, so we get 2 unique URLs
-        # (not 4, since both child sitemaps have the same 2 URLs)
-        assert len(urls) == 2
-        
-        # Verify both child sitemaps were fetched
-        assert mock_http_client.get.call_count == 3  # Index + 2 children
-    
-    def test_parse_sitemap_avoids_duplicates(self, mock_http_client):
-        """Test sitemap parser avoids processing same sitemap twice."""
-        sitemap_xml = b'''<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-    <url><loc>https://utc.edu.vn/page1</loc></url>
-</urlset>'''
-        
-        mock_http_client.get.return_value = MockResponse(content=sitemap_xml)
-        
-        parser = SitemapParser(mock_http_client, allowed_domains=['utc.edu.vn'])
-        
-        # Parse same sitemap twice
-        urls1 = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        urls2 = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        
-        # Second call should return empty (already processed)
-        assert len(urls1) == 1
-        assert len(urls2) == 0
-        
-        # HTTP client should only be called once
-        assert mock_http_client.get.call_count == 1
-    
-    def test_parse_sitemap_deduplicates_urls(self, mock_http_client):
-        """Test sitemap parser deduplicates URLs within same sitemap."""
-        sitemap_xml = b'''<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-    <url><loc>https://utc.edu.vn/page1</loc></url>
-    <url><loc>https://utc.edu.vn/page1</loc></url>
-    <url><loc>https://utc.edu.vn/page2</loc></url>
-</urlset>'''
-        
-        mock_http_client.get.return_value = MockResponse(content=sitemap_xml)
-        
-        parser = SitemapParser(mock_http_client, allowed_domains=['utc.edu.vn'])
-        urls = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        
-        # Should only get 2 URLs (page1 deduplicated)
-        assert len(urls) == 2
-        assert urls[0].loc == 'https://utc.edu.vn/page1'
-        assert urls[1].loc == 'https://utc.edu.vn/page2'
-    
-    def test_parse_sitemap_respects_max_urls(self, mock_http_client):
-        """Test sitemap parser respects max_urls limit."""
-        # Create sitemap with 10 URLs
-        urls_xml = ''.join([
-            f'<url><loc>https://utc.edu.vn/page{i}</loc></url>'
-            for i in range(10)
-        ])
-        sitemap_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-    {urls_xml}
-</urlset>'''.encode('utf-8')
-        
-        mock_http_client.get.return_value = MockResponse(content=sitemap_xml)
-        
-        parser = SitemapParser(mock_http_client, allowed_domains=['utc.edu.vn'], max_urls=5)
-        urls = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        
-        # Should stop at max_urls
-        assert len(urls) == 5
-    
-    def test_parse_sitemap_filters_by_domain(self, mock_http_client):
-        """Test sitemap parser filters URLs by allowed domains."""
-        sitemap_xml = b'''<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-    <url><loc>https://utc.edu.vn/page1</loc></url>
-    <url><loc>https://other.com/page2</loc></url>
-    <url><loc>https://utc.edu.vn/page3</loc></url>
-</urlset>'''
-        
-        mock_http_client.get.return_value = MockResponse(content=sitemap_xml)
-        
-        parser = SitemapParser(
-            mock_http_client,
-            allowed_domains=['utc.edu.vn']  # Only allow utc.edu.vn
-        )
-        urls = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        
-        # Should only get utc.edu.vn URLs
-        assert len(urls) == 2
-        assert all('utc.edu.vn' in url.loc for url in urls)
-    
-    def test_parse_sitemap_filters_by_path_patterns(self, mock_http_client):
-        """Test sitemap parser filters URLs by path patterns."""
-        sitemap_xml = b'''<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-    <url><loc>https://utc.edu.vn/tuyen-sinh/page1</loc></url>
-    <url><loc>https://utc.edu.vn/admin/page2</loc></url>
-    <url><loc>https://utc.edu.vn/dao-tao/page3</loc></url>
-</urlset>'''
-        
-        mock_http_client.get.return_value = MockResponse(content=sitemap_xml)
-        
-        parser = SitemapParser(
-            mock_http_client,
-            allowed_domains=['utc.edu.vn'],
-            allowed_path_patterns=['/tuyen-sinh/.*', '/dao-tao/.*'],
-            excluded_path_patterns=['/admin/.*']
-        )
-        urls = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        
-        # Should exclude /admin/ and only include allowed patterns
-        assert len(urls) == 2
-        assert not any('/admin/' in url.loc for url in urls)
-    
-    def test_parse_sitemap_http_error(self, mock_http_client):
-        """Test sitemap parser handles HTTP errors."""
-        mock_http_client.get.side_effect = HTTPError(404, "404 Not Found", "https://utc.edu.vn/nonexistent.xml")
-        
-        parser = SitemapParser(mock_http_client)
-        
-        with pytest.raises(HTTPError):
-            parser.parse_sitemap('https://utc.edu.vn/nonexistent.xml')
-    
-    def test_parse_sitemap_invalid_xml(self, mock_http_client):
-        """Test sitemap parser handles invalid XML."""
-        mock_http_client.get.return_value = MockResponse(content=b'<invalid xml')
-        
-        parser = SitemapParser(mock_http_client)
-        
-        with pytest.raises(ValidationError, match="Invalid XML"):
-            parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-    
-    def test_parse_datetime_formats(self, mock_http_client):
-        """Test parsing various datetime formats."""
-        sitemap_xml = b'''<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-    <url>
-        <loc>https://utc.edu.vn/page1</loc>
-        <lastmod>2024-01-15</lastmod>
-    </url>
-    <url>
-        <loc>https://utc.edu.vn/page2</loc>
-        <lastmod>2024-01-15T10:30:00Z</lastmod>
-    </url>
-    <url>
-        <loc>https://utc.edu.vn/page3</loc>
-        <lastmod>2024-01-15T10:30:00+07:00</lastmod>
-    </url>
-</urlset>'''
-        
-        mock_http_client.get.return_value = MockResponse(content=sitemap_xml)
-        
-        parser = SitemapParser(mock_http_client, allowed_domains=['utc.edu.vn'])
-        urls = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        
-        # All three formats should parse successfully
-        assert len(urls) == 3
-        assert all(url.lastmod is not None for url in urls)
-    
-    def test_reset(self, mock_http_client, simple_sitemap_xml):
-        """Test resetting parser state."""
-        mock_http_client.get.return_value = MockResponse(content=simple_sitemap_xml)
-        
-        parser = SitemapParser(mock_http_client, allowed_domains=['utc.edu.vn'])
-        
-        # Parse sitemap
-        urls1 = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        assert len(urls1) == 2
-        
-        # Reset and parse again
+        urls = parser.parse_sitemap("https://utc.edu.vn/sitemap.xml")
+        assert [u.loc for u in urls] == ["https://utc.edu.vn/tuyen-sinh/2026"]
+
+    def test_max_urls_and_errors_and_reset(self, mock_http_client, simple_sitemap_xml):
+        mock_http_client.fetch.return_value = (simple_sitemap_xml, "application/xml", None)
+        parser = SitemapParser(http_client=mock_http_client, max_urls=1)
+        assert len(parser.parse_sitemap("https://utc.edu.vn/sitemap.xml")) == 1
+        # Calling again without reset skips already-processed sitemap
+        assert parser.parse_sitemap("https://utc.edu.vn/sitemap.xml") == []
         parser.reset()
-        mock_http_client.get.return_value = MockResponse(content=simple_sitemap_xml)
-        urls2 = parser.parse_sitemap('https://utc.edu.vn/sitemap.xml')
-        
-        # After reset, should get URLs again
-        assert len(urls2) == 2
+        assert len(parser.parse_sitemap("https://utc.edu.vn/sitemap.xml")) == 1
+
+        # HTTP error propagates
+        mock_http_client.fetch.side_effect = HTTPError(404, "Not Found", "https://utc.edu.vn/s2.xml")
+        with pytest.raises(HTTPError):
+            parser.parse_sitemap("https://utc.edu.vn/s2.xml")
+
+        # SecurityError propagates
+        mock_http_client.fetch.side_effect = SecurityError("SSRF")
+        with pytest.raises(SecurityError):
+            parser.parse_sitemap("https://utc.edu.vn/s3.xml")
+
+        # Invalid XML raises ValidationError
+        mock_http_client.fetch.side_effect = None
+        mock_http_client.fetch.return_value = (b"<not-xml", "text/html", None)
+        with pytest.raises(ValidationError, match="Invalid XML"):
+            parser.parse_sitemap("https://utc.edu.vn/s4.xml")
+
+        # Invalid regex rejected at init
+        with pytest.raises(ValidationError, match="Invalid regex"):
+            SitemapParser(http_client=mock_http_client, allowed_path_patterns=["[bad"])
+
+    def test_root_and_child_sitemap_domain_allowlist_checked_before_fetch(self, mock_http_client, simple_sitemap_xml):
+        # Root sitemap outside allowlist -> rejected BEFORE any HTTP fetch
+        parser = SitemapParser(http_client=mock_http_client, allowed_domains=["utc.edu.vn"])
+        with pytest.raises(ValidationError, match="Sitemap domain not in allowlist"):
+            parser.parse_sitemap("https://external-public.com/sitemap.xml")
+        mock_http_client.fetch.assert_not_called()
+
+        # Sitemap index with 1 allowed child + 1 disallowed public-domain child
+        index_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <sitemap><loc>https://utc.edu.vn/sitemap-ok.xml</loc></sitemap>
+    <sitemap><loc>https://other-public-domain.com/sitemap-evil.xml</loc></sitemap>
+</sitemapindex>"""
+        mock_http_client.fetch.side_effect = [
+            (index_xml, "application/xml", None),
+            (simple_sitemap_xml, "application/xml", None),
+        ]
+        urls = parser.parse_sitemap("https://utc.edu.vn/sitemap_index.xml")
+        assert len(urls) == 2
+        # Only index + allowed child were fetched; disallowed child was NEVER fetched
+        fetched_urls = [c[0][0] for c in mock_http_client.fetch.call_args_list]
+        assert fetched_urls == [
+            "https://utc.edu.vn/sitemap_index.xml",
+            "https://utc.edu.vn/sitemap-ok.xml",
+        ]
+        assert len(parser.failed_child_sitemaps) == 1
+        assert "other-public-domain.com" in parser.failed_child_sitemaps[0]

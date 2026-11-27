@@ -1,258 +1,285 @@
-"""
-Security Validator - Prevents SSRF and validates URLs for security.
+"""Security Validator — SSRF protection with DNS resolution and IP validation.
 
-Implements:
-- Private IP detection
-- Localhost detection
-- Redirect validation
-- URL scheme validation
-- Path traversal detection
+Protects against:
+- Non-HTTP(S) schemes (file://, gopher://, ftp://, javascript:, data:, ...)
+- Userinfo in URLs (``http://user:pass@host`` / ``http://127.0.0.1@allowed.com``)
+- Localhost, private (RFC 1918 / RFC 4193), link-local (169.254.0.0/16, fe80::/10),
+  CGNAT (100.64.0.0/10), multicast, unspecified (0.0.0.0, ::), reserved, and
+  IPv4-mapped IPv6 addresses (``::ffff:127.0.0.1``)
+- Decimal / octal / hex IP obfuscations
+- DNS-based SSRF: resolves every A and AAAA record via ``socket.getaddrinfo`` and
+  rejects the URL if ANY resolved IP is non-global / disallowed
+- DNS rebinding: ``validate_and_resolve`` returns the validated IP list so
+  ``HTTPClient`` can connect directly to a validated IP instead of resolving again
+- Path traversal patterns
 """
 
-import logging
 import ipaddress
-from typing import Optional
+import logging
+import socket
+from typing import Callable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from .exceptions import SecurityError
 
-
 logger = logging.getLogger(__name__)
 
+# Additional non-public networks beyond Python's is_global check
+EXTRA_BLOCKED_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),   # Carrier-grade NAT (RFC 6598)
+    ipaddress.ip_network("192.0.0.0/24"),    # IETF Protocol Assignments
+    ipaddress.ip_network("192.0.2.0/24"),    # TEST-NET-1
+    ipaddress.ip_network("198.18.0.0/15"),   # Benchmarking
+    ipaddress.ip_network("198.51.100.0/24"), # TEST-NET-2
+    ipaddress.ip_network("203.0.113.0/24"),  # TEST-NET-3
+    ipaddress.ip_network("240.0.0.0/4"),     # Reserved
+    ipaddress.ip_network("255.255.255.255/32"),
+)
 
-# Private IP ranges (RFC 1918, RFC 4193, etc.)
-PRIVATE_IP_RANGES = [
-    ipaddress.ip_network('10.0.0.0/8'),
-    ipaddress.ip_network('172.16.0.0/12'),
-    ipaddress.ip_network('192.168.0.0/16'),
-    ipaddress.ip_network('127.0.0.0/8'),  # Localhost
-    ipaddress.ip_network('169.254.0.0/16'),  # Link-local
-    ipaddress.ip_network('::1/128'),  # IPv6 localhost
-    ipaddress.ip_network('fc00::/7'),  # IPv6 private
-    ipaddress.ip_network('fe80::/10'),  # IPv6 link-local
-]
+# Type for injectable DNS resolver (useful for unit tests)
+ResolverFunc = Callable[[str, Optional[int]], List[str]]
+
+
+def default_dns_resolver(hostname: str, port: Optional[int] = None) -> List[str]:
+    """Resolve hostname to unique IP strings (both IPv4 and IPv6)."""
+    infos = socket.getaddrinfo(hostname, port or 80, type=socket.SOCK_STREAM)
+    ips: List[str] = []
+    seen = set()
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        ip_str = sockaddr[0]
+        if ip_str not in seen:
+            seen.add(ip_str)
+            ips.append(ip_str)
+    return ips
+
+
+def is_disallowed_ip(ip_str: str) -> bool:
+    """Return True if ``ip_str`` is private, loopback, link-local, multicast,
+    unspecified, reserved, or otherwise not globally routable.
+    Handles IPv4, IPv6, and IPv4-mapped IPv6 addresses.
+    """
+    # Strip IPv6 zone index if present (e.g. fe80::1%eth0)
+    clean = ip_str.split("%", 1)[0]
+    ip = ipaddress.ip_address(clean)
+
+    # Unwrap IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1 or ::ffff:10.0.0.1)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+        or not ip.is_global
+    ):
+        return True
+
+    if isinstance(ip, ipaddress.IPv4Address):
+        for net in EXTRA_BLOCKED_NETWORKS:
+            if ip in net:
+                return True
+
+    return False
 
 
 class SecurityValidator:
-    """Validates URLs for security issues."""
-    
+    """Validates URLs and resolved IPs against SSRF and URL attacks."""
+
     def __init__(
         self,
-        allowed_schemes: Optional[list] = None,
+        allowed_schemes: Optional[List[str]] = None,
         allow_private_ips: bool = False,
+        resolve_dns: bool = True,
+        allow_userinfo: bool = False,
+        resolver: Optional[ResolverFunc] = None,
     ):
-        """
-        Initialize security validator.
-        
-        Args:
-            allowed_schemes: List of allowed URL schemes (default: ['http', 'https'])
-            allow_private_ips: Whether to allow private/internal IPs (default: False)
-        """
-        self.allowed_schemes = set(allowed_schemes or ['http', 'https'])
+        self.allowed_schemes = {s.lower() for s in (allowed_schemes or ["http", "https"])}
         self.allow_private_ips = allow_private_ips
-    
+        self.resolve_dns = resolve_dns
+        self.allow_userinfo = allow_userinfo
+        self._resolver = resolver or default_dns_resolver
+
     def validate_url(self, url: str, context: str = "") -> None:
-        """
-        Validate URL for security issues.
-        
-        Args:
-            url: URL to validate
-            context: Context string for error messages (e.g., "redirect destination")
-            
+        """Validate URL syntax, host, and (when enabled) DNS resolution.
+
         Raises:
-            SecurityError: If URL fails security validation
+            SecurityError: If URL fails any security check.
         """
-        parsed = urlparse(url)
-        
-        # Check scheme
-        if parsed.scheme not in self.allowed_schemes:
+        self.validate_and_resolve(url, context=context)
+
+    def validate_and_resolve(self, url: str, context: str = "") -> Tuple[str, List[str]]:
+        """Validate URL and return ``(hostname, validated_ips)``.
+
+        When ``resolve_dns=False``, ``validated_ips`` is empty for non-IP hostnames.
+        When ``resolve_dns=True``, every returned IP has been verified safe; if
+        DNS resolution fails, raises ``SecurityError``.
+        """
+        if not url or not isinstance(url, str):
+            raise SecurityError(f"Empty or invalid URL {context}")
+
+        if any(ch in url for ch in ("\r", "\n", "\x00")):
+            raise SecurityError(f"Control characters in URL not allowed {context}: {url!r}")
+
+        try:
+            parsed = urlparse(url)
+            port = parsed.port  # validates numeric port
+        except ValueError as e:
+            raise SecurityError(f"Malformed URL {context}: {url} ({e})") from e
+
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in self.allowed_schemes:
             raise SecurityError(
-                f"Invalid URL scheme '{parsed.scheme}' {context}: {url}. "
-                f"Allowed schemes: {', '.join(self.allowed_schemes)}"
+                f"Invalid URL scheme '{scheme}' {context}: {url}. "
+                f"Allowed schemes: {', '.join(sorted(self.allowed_schemes))}"
             )
-        
-        # Check for empty host
-        if not parsed.netloc:
+
+        if not parsed.netloc or not parsed.hostname:
             raise SecurityError(f"URL missing host {context}: {url}")
-        
-        # Extract hostname (remove port and userinfo if present)
-        # SECURITY: Check userinfo first - some parsers/clients may handle it differently
-        netloc = parsed.netloc
-        userinfo = None
-        if '@' in netloc:
-            # Split userinfo from hostname
-            userinfo, netloc = netloc.rsplit('@', 1)
-            
-            # Check if userinfo contains localhost or private IP patterns
-            # This prevents bypass attempts like "localhost@allowed.com"
-            if userinfo.lower() in ('localhost', '127.0.0.1', '::1', '0.0.0.0'):
-                raise SecurityError(f"Localhost in userinfo not allowed {context}: {url}")
-            
-            # Also check for private IP patterns in userinfo
-            userinfo_lower = userinfo.lower()
-            if any(pattern in userinfo_lower for pattern in ['127.', '192.168.', '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.']):
-                raise SecurityError(f"Private IP pattern in userinfo not allowed {context}: {url}")
-        
-        # Handle IPv6 addresses with brackets first
-        if netloc.startswith('['):
-            # IPv6 address: [::1] or [::1]:8080
-            if ']:' in netloc:
-                # Has port: [::1]:8080
-                hostname = netloc.split(']:')[0][1:]  # Remove [ and extract up to ]
-            else:
-                # No port: [::1]
-                hostname = netloc[1:-1]  # Remove [ and ]
-        else:
-            # IPv4 or hostname: remove port if present
-            hostname = netloc.split(':')[0]
-        
-        hostname = hostname.lower()
-        
-        # Check for localhost aliases
-        if hostname in ('localhost', '127.0.0.1', '::1', '0.0.0.0', '::'):
-            raise SecurityError(f"Localhost not allowed {context}: {url}")
-        
-        # Check for private IPs
-        if not self.allow_private_ips:
-            if self._is_private_ip(hostname):
-                raise SecurityError(f"Private IP address not allowed {context}: {url}")
-        
-        # Check for path traversal attempts (including query and fragment)
+
+        # Reject userinfo (e.g. http://user:pass@host or http://127.0.0.1@allowed.com)
+        if (parsed.username is not None or parsed.password is not None or "@" in parsed.netloc) and not self.allow_userinfo:
+            raise SecurityError(f"Userinfo in URL not allowed {context}: {url}")
+
+        # Check path traversal before any network lookup
         if self._has_path_traversal(url):
             raise SecurityError(f"Path traversal detected {context}: {url}")
-        
-        logger.debug(f"URL passed security validation {context}: {url}")
-    
-    def _is_private_ip(self, hostname: str) -> bool:
-        """
-        Check if hostname resolves to a private IP address.
-        
-        Args:
-            hostname: Hostname or IP address string
-            
-        Returns:
-            True if hostname is or resolves to a private IP
-        """
+
+        hostname = parsed.hostname.strip().rstrip(".").lower()
+        if not hostname:
+            raise SecurityError(f"Empty hostname {context}: {url}")
+
+        # Block localhost / internal special-use names immediately
+        if not self.allow_private_ips and (
+            hostname in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback")
+            or hostname.endswith(".localhost")
+            or hostname.endswith(".local")
+            or hostname.endswith(".internal")
+        ):
+            raise SecurityError(f"Localhost/internal hostname not allowed {context}: {url}")
+
+        # Check literal IP (standard, IPv6, or decimal/hex/octal obfuscation)
+        literal_ip = self._try_parse_literal_ip(hostname)
+        if literal_ip is not None:
+            if not self.allow_private_ips and is_disallowed_ip(literal_ip):
+                raise SecurityError(f"Private or disallowed IP address not allowed {context}: {url} ({literal_ip})")
+            return hostname, [literal_ip]
+
+        # Convert IDN hostname to ASCII punycode for DNS resolution
         try:
-            # Try to parse as IP address directly
-            ip = ipaddress.ip_address(hostname)
-            
-            # Check against private ranges
-            for private_range in PRIVATE_IP_RANGES:
-                if ip in private_range:
-                    logger.warning(f"Private IP detected: {hostname} ({ip})")
-                    return True
-            
-            return False
-            
+            ascii_host = hostname.encode("idna").decode("ascii")
+        except UnicodeError as e:
+            raise SecurityError(f"Invalid IDN hostname {context}: {hostname}") from e
+
+        if not self.resolve_dns:
+            return ascii_host, []
+
+        # Resolve DNS and validate EVERY returned IP (A and AAAA)
+        try:
+            resolved_ips = self._resolver(ascii_host, port or (443 if scheme == "https" else 80))
+        except socket.gaierror as e:
+            raise SecurityError(f"DNS resolution failed for '{ascii_host}' {context}: {e}") from e
+        except Exception as e:
+            raise SecurityError(f"DNS lookup error for '{ascii_host}' {context}: {e}") from e
+
+        if not resolved_ips:
+            raise SecurityError(f"DNS returned no addresses for '{ascii_host}' {context}")
+
+        if not self.allow_private_ips:
+            for ip_str in resolved_ips:
+                try:
+                    if is_disallowed_ip(ip_str):
+                        raise SecurityError(
+                            f"Hostname '{ascii_host}' resolved to disallowed IP {ip_str} {context}: {url}"
+                        )
+                except ValueError as e:
+                    raise SecurityError(
+                        f"Hostname '{ascii_host}' resolved to invalid IP '{ip_str}' {context}"
+                    ) from e
+
+        logger.debug("URL passed security validation %s: %s -> %s", context, url, resolved_ips)
+        return ascii_host, resolved_ips
+
+    def _try_parse_literal_ip(self, hostname: str) -> Optional[str]:
+        """Return canonical IP string if hostname is an IP literal (incl. decimal/hex/octal), else None."""
+        clean = hostname.split("%", 1)[0]
+        try:
+            return str(ipaddress.ip_address(clean))
         except ValueError:
-            # Not a standard IP address string
-            # Try parsing as decimal/octal/hex notation
+            pass
+
+        # Single integer IPv4 (e.g. 2130706433 -> 127.0.0.1) or hex (0x7f000001)
+        try:
+            if clean.isdigit():
+                val = int(clean, 10)
+                if 0 <= val <= 0xFFFFFFFF:
+                    return str(ipaddress.IPv4Address(val))
+            elif clean.startswith("0x") and len(clean) > 2:
+                val = int(clean, 16)
+                if 0 <= val <= 0xFFFFFFFF:
+                    return str(ipaddress.IPv4Address(val))
+        except (ValueError, ipaddress.AddressValueError):
+            pass
+
+        # Dotted octal/hex IPv4 (e.g. 0177.0.0.1 or 0x7f.0.0.1)
+        parts = clean.split(".")
+        if 1 < len(parts) <= 4 and all(p for p in parts):
             try:
-                # Check if it's a decimal IP (e.g., 2130706433 = 127.0.0.1)
-                if hostname.isdigit():
-                    decimal_ip = int(hostname)
-                    # Convert to IPv4 address (valid range: 0 to 2^32-1)
-                    if 0 <= decimal_ip <= 0xFFFFFFFF:
-                        ip = ipaddress.IPv4Address(decimal_ip)
-                        for private_range in PRIVATE_IP_RANGES:
-                            if ip in private_range:
-                                logger.warning(f"Private IP detected (decimal notation): {hostname} ({ip})")
-                                return True
-            except (ValueError, ipaddress.AddressValueError):
+                nums = []
+                for p in parts:
+                    if p.startswith(("0x", "0X")):
+                        nums.append(int(p, 16))
+                    elif len(p) > 1 and p.startswith("0") and p.isdigit():
+                        nums.append(int(p, 8))
+                    else:
+                        nums.append(int(p, 10))
+                if len(nums) == 4 and all(0 <= n <= 255 for n in nums):
+                    return str(ipaddress.IPv4Address(bytes(nums)))
+            except ValueError:
                 pass
-            
-            # Not an IP address, might be a hostname
-            # We can't resolve hostnames here without actual DNS lookup
-            # which could cause SSRF. So we only check if it looks suspicious.
-            
-            # Check for IP-like patterns that might bypass filters
-            suspicious_patterns = [
-                'localhost',
-                '127.',
-                '192.168.',
-                '10.',
-                '172.16.',
-                '172.17.',
-                '172.18.',
-                '172.19.',
-                '172.20.',
-                '172.21.',
-                '172.22.',
-                '172.23.',
-                '172.24.',
-                '172.25.',
-                '172.26.',
-                '172.27.',
-                '172.28.',
-                '172.29.',
-                '172.30.',
-                '172.31.',
-            ]
-            
-            hostname_lower = hostname.lower()
-            for pattern in suspicious_patterns:
-                if pattern in hostname_lower:
-                    logger.warning(f"Suspicious hostname pattern detected: {hostname}")
-                    return True
-            
-            return False
-    
+
+        return None
+
+    def _is_private_ip(self, hostname: str) -> bool:
+        """Backward-compatible helper: check if literal IP or localhost pattern is disallowed."""
+        h = hostname.strip().rstrip(".").lower()
+        if h in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback") or h.endswith(".localhost"):
+            return True
+        literal = self._try_parse_literal_ip(h)
+        if literal is not None:
+            return is_disallowed_ip(literal)
+        return False
+
     def _has_path_traversal(self, url: str) -> bool:
-        """
-        Check for path traversal attempts in URL.
-        
-        Args:
-            url: Full URL to check
-            
-        Returns:
-            True if URL contains traversal patterns
-        """
+        """Check for directory traversal patterns in URL."""
         if not url:
             return False
-        
-        # Check for directory traversal patterns
-        traversal_patterns = [
-            '../',
-            '..\\',
-            '%2e%2e/',
-            '%2e%2e\\',
-            '..%2f',
-            '..%5c',
-        ]
-        
+        traversal_patterns = (
+            "../",
+            "..\\",
+            "%2e%2e/",
+            "%2e%2e\\",
+            "..%2f",
+            "..%5c",
+            "%2e%2e%2f",
+            "%2e%2e%5c",
+        )
         url_lower = url.lower()
         for pattern in traversal_patterns:
             if pattern in url_lower:
-                logger.warning(f"Path traversal pattern detected in URL: {url}")
+                logger.warning("Path traversal pattern detected in URL: %s", url)
                 return True
-        
         return False
-    
-    def validate_redirect(self, original_url: str, redirect_url: str) -> None:
-        """
-        Validate that redirect destination is safe.
-        
-        Args:
-            original_url: Original URL that initiated the request
-            redirect_url: Redirect destination URL
-            
-        Raises:
-            SecurityError: If redirect fails security validation
-        """
-        logger.info(f"Validating redirect: {original_url} -> {redirect_url}")
-        
-        # Validate redirect destination with same security rules
-        self.validate_url(redirect_url, context="(redirect destination)")
-        
-        # Additional check: warn if redirect changes domain
-        original_domain = urlparse(original_url).netloc.lower()
-        redirect_domain = urlparse(redirect_url).netloc.lower()
-        
-        if original_domain != redirect_domain:
-            logger.warning(
-                f"Redirect changes domain: {original_domain} -> {redirect_domain}"
-            )
-            # Note: We allow cross-domain redirects for legitimate cases (e.g., CDN)
-            # but log them for monitoring
 
+    def validate_redirect(self, original_url: str, redirect_url: str) -> Tuple[str, List[str]]:
+        """Validate redirect destination and return ``(hostname, validated_ips)``."""
+        logger.debug("Validating redirect: %s -> %s", original_url, redirect_url)
+        result = self.validate_and_resolve(redirect_url, context="(redirect destination)")
+
+        orig_host = (urlparse(original_url).hostname or "").lower()
+        redir_host = (urlparse(redirect_url).hostname or "").lower()
+        if orig_host != redir_host:
+            logger.info("Redirect changes host: %s -> %s", orig_host, redir_host)
+        return result

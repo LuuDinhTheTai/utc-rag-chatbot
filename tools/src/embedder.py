@@ -1,60 +1,87 @@
-"""Ollama embedding client.
+"""Ollama embedding client using the ``/api/embed`` batch endpoint.
 
-Generates embeddings using configured Ollama model with retry and validation.
+Matches the backend ``OllamaClient`` contract:
+- Endpoint: ``POST {base_url}/api/embed`` with ``{"model": ..., "input": [...], "truncate": false}``
+- Dimension: 768 (strictly validated; rejects booleans, NaN, Inf)
+- Retries transient errors (HTTP 429, 500, 502, 503, 504, timeouts, connection errors)
+  with bounded exponential backoff
+- Checks ``JobContext.checkpoint()`` between batches and retries so long embedding
+  runs cannot outlive a job lease silently.
 """
 
 import logging
+import math
 import time
+from typing import List, Optional
+
 import requests
-from typing import List
 
 from .config import OllamaConfig
 from .exceptions import EmbeddingError
+from .job_context import JobContext
 
 logger = logging.getLogger(__name__)
 
+TRANSIENT_EMBED_STATUSES = frozenset({429, 500, 502, 503, 504})
+
 
 class OllamaEmbedder:
-    """Client for generating embeddings via Ollama API."""
+    """Client for generating embeddings via Ollama ``/api/embed``."""
 
     def __init__(self, config: OllamaConfig):
-        """Initialize Ollama client.
-
-        Args:
-            config: Ollama configuration
-        """
         self.config = config
-        self.embed_url = f"{config.base_url}/api/embeddings"
+        self.embed_url = f"{config.base_url.rstrip('/')}/api/embed"
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Content-Type": "application/json",
-            }
-        )
+        self.session.headers.update({"Content-Type": "application/json"})
 
-    def embed(self, text: str, retry_count: int = 3) -> List[float]:
-        """Generate embedding for text.
+    def _validate_vector(self, vec: object) -> List[float]:
+        if not isinstance(vec, list):
+            raise EmbeddingError(f"Invalid embedding type: {type(vec).__name__}")
+        if len(vec) != self.config.embedding_dimension:
+            raise EmbeddingError(
+                f"Embedding dimension mismatch: expected {self.config.embedding_dimension}, got {len(vec)}"
+            )
+        result: List[float] = []
+        for v in vec:
+            # In Python isinstance(True, int) is True — explicitly reject bool!
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise EmbeddingError(f"Embedding contains invalid value: {v!r}")
+            result.append(float(v))
+        return result
 
-        Args:
-            text: Text to embed
-            retry_count: Number of retries on failure
-
-        Returns:
-            Embedding vector as list of floats
-
-        Raises:
-            EmbeddingError: If embedding generation fails
-        """
-        if not text or not text.strip():
+    def _validate_input_text(self, text: str) -> str:
+        if not isinstance(text, str) or not text.strip():
             raise EmbeddingError("Cannot embed empty text")
+        if len(text) > self.config.max_input_chars:
+            raise EmbeddingError(
+                f"Input text exceeds max_input_chars ({len(text)} > {self.config.max_input_chars})"
+            )
+        return text
 
-        for attempt in range(retry_count):
+    def _sleep(self, seconds: float, job_context: Optional[JobContext]) -> None:
+        if job_context:
+            job_context.sleep(seconds)
+        else:
+            time.sleep(seconds)
+
+    def _post_embed(
+        self,
+        inputs: List[str],
+        retry_count: Optional[int] = None,
+        job_context: Optional[JobContext] = None,
+    ) -> List[List[float]]:
+        attempts = max(1, self.config.max_retries if retry_count is None else retry_count)
+
+        for attempt in range(attempts):
+            if job_context:
+                job_context.checkpoint()
             try:
                 response = self.session.post(
                     self.embed_url,
                     json={
                         "model": self.config.embedding_model,
-                        "prompt": text,
+                        "input": inputs,
+                        "truncate": False,
                     },
                     timeout=(
                         self.config.connect_timeout_seconds,
@@ -62,112 +89,103 @@ class OllamaEmbedder:
                     ),
                 )
 
+                if response.status_code in TRANSIENT_EMBED_STATUSES:
+                    status = response.status_code
+                    body_preview = response.text[:200]
+                    response.close()
+                    if attempt + 1 < attempts:
+                        wait_time = min(2 ** attempt, 30)
+                        logger.warning(
+                            "Ollama transient HTTP %d (attempt %d/%d), retrying in %ss: %s",
+                            status, attempt + 1, attempts, wait_time, body_preview,
+                        )
+                        self._sleep(wait_time, job_context)
+                        continue
+                    raise EmbeddingError(
+                        f"Ollama API returned HTTP {status} after {attempts} attempts: {body_preview}"
+                    )
+
                 if response.status_code != 200:
+                    body_preview = response.text[:300]
+                    response.close()
                     raise EmbeddingError(
-                        f"Ollama API returned status {response.status_code}: {response.text}"
+                        f"Ollama API returned status {response.status_code}: {body_preview}"
                     )
 
-                result = response.json()
+                data = response.json()
+                response.close()
 
-                # Extract embedding from Ollama response
-                # Response format: {"embedding": [0.1, 0.2, ...]}
-                if "embedding" not in result:
+                raw_embeddings = data.get("embeddings")
+                if not isinstance(raw_embeddings, list) or len(raw_embeddings) != len(inputs):
                     raise EmbeddingError(
-                        f"Invalid Ollama response: missing 'embedding' field"
+                        f"Invalid Ollama /api/embed response: expected {len(inputs)} embedding(s), "
+                        f"got {type(raw_embeddings).__name__}"
                     )
 
-                embedding = result["embedding"]
+                return [self._validate_vector(vec) for vec in raw_embeddings]
 
-                # Validate embedding
-                if not isinstance(embedding, list):
-                    raise EmbeddingError(
-                        f"Invalid embedding type: {type(embedding)}"
-                    )
-
-                if len(embedding) != self.config.embedding_dimension:
-                    raise EmbeddingError(
-                        f"Embedding dimension mismatch: expected {self.config.embedding_dimension}, "
-                        f"got {len(embedding)}"
-                    )
-
-                # Validate all values are finite
-                if not all(isinstance(v, (int, float)) and abs(v) < float('inf') for v in embedding):
-                    raise EmbeddingError("Embedding contains invalid values")
-
-                logger.debug(
-                    f"Generated embedding for {len(text)} chars "
-                    f"(dim={len(embedding)}, model={self.config.embedding_model})"
-                )
-
-                return embedding
-
-            except requests.exceptions.Timeout as e:
-                if attempt < retry_count - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt + 1 < attempts:
+                    wait_time = min(2 ** attempt, 30)
                     logger.warning(
-                        f"Ollama timeout (attempt {attempt + 1}/{retry_count}), "
-                        f"retrying in {wait_time}s: {e}"
+                        "Ollama network error (attempt %d/%d), retrying in %ss: %s",
+                        attempt + 1, attempts, wait_time, e,
                     )
-                    time.sleep(wait_time)
-                else:
-                    raise EmbeddingError(f"Ollama timeout after {retry_count} attempts: {e}") from e
+                    self._sleep(wait_time, job_context)
+                    continue
+                raise EmbeddingError(f"Ollama request failed after {attempts} attempts: {e}") from e
 
             except requests.exceptions.RequestException as e:
-                if attempt < retry_count - 1:
-                    wait_time = 2 ** attempt
-                    logger.warning(
-                        f"Ollama request failed (attempt {attempt + 1}/{retry_count}), "
-                        f"retrying in {wait_time}s: {e}"
-                    )
-                    time.sleep(wait_time)
-                else:
-                    raise EmbeddingError(f"Ollama request failed after {retry_count} attempts: {e}") from e
+                raise EmbeddingError(f"Ollama request error: {e}") from e
 
             except EmbeddingError:
-                # Don't retry on validation errors
                 raise
 
             except Exception as e:
                 raise EmbeddingError(f"Unexpected error generating embedding: {e}") from e
 
-        raise EmbeddingError(f"Failed to generate embedding after {retry_count} attempts")
+        raise EmbeddingError(f"Failed to generate embedding after {attempts} attempts")
 
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for multiple texts.
+    def embed(
+        self,
+        text: str,
+        retry_count: Optional[int] = None,
+        job_context: Optional[JobContext] = None,
+    ) -> List[float]:
+        """Generate an embedding vector for a single text."""
+        validated = self._validate_input_text(text)
+        vectors = self._post_embed([validated], retry_count=retry_count, job_context=job_context)
+        return vectors[0]
 
-        Args:
-            texts: List of texts to embed
+    def embed_batch(
+        self,
+        texts: List[str],
+        job_context: Optional[JobContext] = None,
+    ) -> List[List[float]]:
+        """Generate embeddings for multiple texts using real Ollama batching."""
+        if not texts:
+            return []
 
-        Returns:
-            List of embedding vectors
+        validated = [self._validate_input_text(t) for t in texts]
+        batch_size = max(1, self.config.embed_batch_size)
+        all_vectors: List[List[float]] = []
 
-        Raises:
-            EmbeddingError: If any embedding generation fails
-        """
-        embeddings = []
-        for i, text in enumerate(texts):
-            try:
-                embedding = self.embed(text)
-                embeddings.append(embedding)
-            except EmbeddingError as e:
-                raise EmbeddingError(
-                    f"Failed to embed text {i + 1}/{len(texts)}: {e}"
-                ) from e
+        for start in range(0, len(validated), batch_size):
+            if job_context:
+                job_context.checkpoint()
+            batch = validated[start : start + batch_size]
+            vectors = self._post_embed(batch, job_context=job_context)
+            all_vectors.extend(vectors)
 
-        return embeddings
+        return all_vectors
 
     def health_check(self) -> bool:
-        """Check if Ollama service is accessible.
-
-        Returns:
-            True if healthy, False otherwise
-        """
+        """Return True if Ollama answers ``/api/embed`` with a valid 768-dim vector."""
         try:
-            # Try to generate embedding for simple text
-            test_embedding = self.embed("test", retry_count=1)
-            return len(test_embedding) == self.config.embedding_dimension
+            vec = self.embed("health check", retry_count=1)
+            return len(vec) == self.config.embedding_dimension
         except Exception as e:
-            logger.error(f"Ollama health check failed: {e}")
+            logger.error("Ollama health check failed: %s", e)
             return False
 
     def close(self) -> None:

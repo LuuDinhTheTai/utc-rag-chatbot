@@ -1,180 +1,226 @@
-"""
-Automatic crawl job scheduler.
+"""Automatic crawl job scheduler.
 
 Creates periodic crawl jobs for enabled sources without manual intervention.
-Implements requirement: "crawler tự lập lịch; không cần chạy lệnh ingest thủ công"
+
+Scheduling rules
+----------------
+A new PENDING job is created for an enabled source iff:
+1. No PENDING or RUNNING job currently exists for that source (enforced both in
+   the query and by the partial unique index ``crawl_jobs (source_id) WHERE
+   status IN ('PENDING', 'RUNNING')`` so multiple scheduler instances are safe).
+2. Either no previous COMPLETED/FAILED job exists, OR the elapsed time since the
+   most recent finished job's ``completed_at`` (falling back to ``created_at``
+   for legacy rows) is >= ``crawl_interval_hours`` (or ``default_interval_hours``).
 """
 
 import logging
 import signal
-import time
 import sys
+import threading
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
 
+import psycopg
+
+from .config import SchedulerConfig, load_config, touch_liveness
 from .database import Database
-from .config import Config
-from .source_registry import SourceRegistry
 from .exceptions import DatabaseError
 
 logger = logging.getLogger(__name__)
 
 
 class CrawlScheduler:
-    """
-    Automatic scheduler that creates crawl jobs for enabled sources.
-    
-    - Runs periodically to check if sources need crawling
-    - Creates jobs for sources without active/pending jobs
-    - Respects source-specific crawl intervals
-    """
-    
+    """Automatic scheduler that creates crawl jobs for enabled sources."""
+
     def __init__(
         self,
         database: Database,
         default_interval_hours: int = 6,
-        check_interval_seconds: int = 300,  # Check every 5 minutes
+        check_interval_seconds: int = 300,
+        liveness_file: Optional[str] = None,
+        register_signals: bool = True,
     ):
-        """
-        Initialize scheduler.
-        
-        Args:
-            database: Database connection manager
-            default_interval_hours: Default crawl interval (6 hours)
-            check_interval_seconds: How often to check for scheduling (5 minutes)
-        """
+        if default_interval_hours < 1:
+            raise ValueError("default_interval_hours must be >= 1")
+        if check_interval_seconds < 1:
+            raise ValueError("check_interval_seconds must be >= 1")
+
         self.database = database
         self.default_interval_hours = default_interval_hours
         self.check_interval_seconds = check_interval_seconds
-        self.stopped = False
-        
-        # Register signal handlers
-        signal.signal(signal.SIGTERM, self._handle_shutdown)
-        signal.signal(signal.SIGINT, self._handle_shutdown)
-    
-    def _handle_shutdown(self, signum, frame):
-        """Handle shutdown signals."""
-        logger.info(f"Scheduler received signal {signum}, shutting down gracefully...")
-        self.stopped = True
-    
-    def run(self):
-        """
-        Main scheduler loop.
-        
-        Continuously checks for sources needing crawl jobs and creates them.
-        """
-        logger.info(
-            f"Scheduler starting: checking every {self.check_interval_seconds}s, "
-            f"default interval {self.default_interval_hours}h"
-        )
-        
-        # Initialize database
-        self.database.connect()
-        
-        if not self.database.health_check():
-            logger.error("Database health check failed")
-            sys.exit(1)
-        
-        logger.info("Scheduler ready")
-        
-        # Initial scheduling pass
-        try:
-            self._schedule_jobs()
-        except Exception as e:
-            logger.error(f"Initial scheduling failed: {e}", exc_info=True)
-        
-        # Main loop
-        while not self.stopped:
+        self.liveness_file = liveness_file
+        self._stop_event = threading.Event()
+
+        if register_signals:
             try:
-                time.sleep(self.check_interval_seconds)
-                
-                if self.stopped:
-                    break
-                
-                self._schedule_jobs()
-                
-            except KeyboardInterrupt:
-                logger.info("Keyboard interrupt received")
-                self.stopped = True
-                break
-            
-            except Exception as e:
-                logger.error(f"Scheduler error: {e}", exc_info=True)
-                time.sleep(60)  # Wait 1 minute before retrying on error
-        
-        # Cleanup
-        logger.info("Scheduler shutting down...")
-        self.database.close()
-        logger.info("Scheduler stopped")
-    
-    def _schedule_jobs(self):
-        """
-        Check all enabled sources and create jobs if needed.
-        
-        A source needs a job if:
-        - It's enabled
-        - No PENDING or RUNNING job exists for it
-        - Last completed job is older than crawl interval (or no completed job exists)
-        """
+                signal.signal(signal.SIGTERM, self._handle_shutdown)
+                signal.signal(signal.SIGINT, self._handle_shutdown)
+            except ValueError:
+                # Signal registration only works in the main thread (e.g. unit tests)
+                pass
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+    @stopped.setter
+    def stopped(self, value: bool) -> None:
+        if value:
+            self._stop_event.set()
+        else:
+            self._stop_event.clear()
+
+    def _handle_shutdown(self, signum, frame) -> None:
+        logger.info("Scheduler received signal %s, shutting down gracefully...", signum)
+        self._stop_event.set()
+
+    def _verify_schema_ready(self) -> bool:
+        """Confirm required scheduler columns exist before entering the main loop."""
         try:
-            # Get all enabled sources
-            source_registry = SourceRegistry(self.database)
-            sources = self._get_enabled_sources()
-            
-            if not sources:
-                logger.debug("No enabled sources found")
-                return
-            
-            logger.debug(f"Checking {len(sources)} enabled sources for scheduling")
-            
-            scheduled_count = 0
-            
-            for source in sources:
-                try:
-                    if self._should_schedule_job(source):
-                        self._create_job(source)
-                        scheduled_count += 1
-                except Exception as e:
-                    logger.error(
-                        f"Failed to schedule job for source {source['id']} ({source['name']}): {e}"
-                    )
-            
-            if scheduled_count > 0:
-                logger.info(f"Scheduled {scheduled_count} new crawl jobs")
-            
-        except Exception as e:
-            logger.error(f"Failed to schedule jobs: {e}", exc_info=True)
-            raise
-    
-    def _get_enabled_sources(self) -> List[Dict[str, Any]]:
-        """Get all enabled crawl sources."""
-        try:
-            results = self.database.execute_many(
+            row = self.database.execute_one(
                 """
-                SELECT id, name, base_url, crawl_interval_hours
+                SELECT
+                    EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'crawl_sources'
+                          AND column_name = 'crawl_interval_hours'
+                    ) AS has_interval,
+                    EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'crawl_jobs'
+                          AND column_name = 'created_at'
+                    ) AS has_created_at,
+                    EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'crawl_jobs'
+                          AND column_name = 'completed_at'
+                    ) AS has_completed_at
+                """
+            )
+            if not row:
+                return False
+            missing = [
+                col
+                for col, ok in (
+                    ("crawl_sources.crawl_interval_hours", row["has_interval"]),
+                    ("crawl_jobs.created_at", row["has_created_at"]),
+                    ("crawl_jobs.completed_at", row["has_completed_at"]),
+                )
+                if not ok
+            ]
+            if missing:
+                logger.error(
+                    "Database schema is not ready for scheduler; missing columns: %s. "
+                    "Apply migrations 005..009 before starting.",
+                    ", ".join(missing),
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.error("Failed to verify database schema: %s", e)
+            return False
+
+    def run(self) -> None:
+        """Main scheduler loop. Always closes the database pool on exit."""
+        logger.info(
+            "Scheduler starting: checking every %ss, default interval %sh",
+            self.check_interval_seconds,
+            self.default_interval_hours,
+        )
+
+        try:
+            self.database.connect()
+
+            if not self.database.health_check():
+                logger.error("Database health check failed")
+                sys.exit(1)
+
+            if not self._verify_schema_ready():
+                sys.exit(1)
+
+            logger.info("Scheduler ready")
+            touch_liveness(self.liveness_file)
+
+            while not self._stop_event.is_set():
+                try:
+                    self.schedule_once()
+                    touch_liveness(self.liveness_file)
+                except KeyboardInterrupt:
+                    logger.info("Keyboard interrupt received")
+                    self._stop_event.set()
+                    break
+                except Exception as e:
+                    logger.error("Scheduler pass failed: %s", e, exc_info=True)
+                    if self._stop_event.wait(min(60, self.check_interval_seconds)):
+                        break
+                    continue
+
+                if self._stop_event.wait(self.check_interval_seconds):
+                    break
+        finally:
+            logger.info("Scheduler shutting down...")
+            self.database.close()
+            logger.info("Scheduler stopped")
+
+    def schedule_once(self) -> int:
+        """Run one scheduling pass across all enabled sources.
+
+        Returns:
+            Number of new jobs created.
+        """
+        sources = self._get_enabled_sources()
+        if not sources:
+            logger.debug("No enabled sources found")
+            return 0
+
+        logger.debug("Checking %d enabled sources for scheduling", len(sources))
+        scheduled_count = 0
+
+        for source in sources:
+            if self._stop_event.is_set():
+                break
+            try:
+                if self._should_schedule_job(source):
+                    if self._create_job(source) is not None:
+                        scheduled_count += 1
+            except Exception as e:
+                logger.error(
+                    "Failed to schedule job for source %s (%s): %s",
+                    source["id"],
+                    source["base_url"],
+                    e,
+                )
+
+        if scheduled_count > 0:
+            logger.info("Scheduled %d new crawl job(s)", scheduled_count)
+
+        return scheduled_count
+
+    # Backward-compatible alias
+    _schedule_jobs = schedule_once
+
+    def _get_enabled_sources(self) -> List[Dict[str, Any]]:
+        """Get all enabled crawl sources (uses actual schema columns; no name column)."""
+        try:
+            return self.database.execute(
+                """
+                SELECT id, base_url, crawl_interval_hours
                 FROM crawl_sources
                 WHERE enabled = true
                 ORDER BY id
                 """
             )
-            return results
         except Exception as e:
             raise DatabaseError(f"Failed to fetch enabled sources: {e}") from e
-    
+
     def _should_schedule_job(self, source: Dict[str, Any]) -> bool:
-        """
-        Check if a job should be scheduled for this source.
-        
-        Args:
-            source: Source dictionary with id, name, crawl_interval_hours
-            
-        Returns:
-            True if a job should be created
-        """
-        source_id = source['id']
-        source_name = source['name']
-        
-        # Check for active/pending jobs
+        """Check whether a new job should be scheduled for ``source``."""
+        source_id = source["id"]
+        label = source["base_url"]
+
         active_job = self.database.execute_one(
             """
             SELECT id, status
@@ -183,147 +229,140 @@ class CrawlScheduler:
               AND status IN ('PENDING', 'RUNNING')
             LIMIT 1
             """,
-            {'source_id': source_id}
+            {"source_id": source_id},
         )
-        
         if active_job:
             logger.debug(
-                f"Source {source_id} ({source_name}) has active job {active_job['id']}, skipping"
+                "Source %s (%s) has active %s job %s, skipping",
+                source_id, label, active_job["status"], active_job["id"],
             )
             return False
-        
-        # Get last completed job
+
+        # Compare using the database clock so clock skew between containers cannot
+        # trigger premature or delayed crawls.
         last_job = self.database.execute_one(
             """
-            SELECT id, status, completed_at, created_at
+            SELECT
+                id,
+                status,
+                completed_at,
+                created_at,
+                clock_timestamp() AS db_now
             FROM crawl_jobs
             WHERE source_id = %(source_id)s
               AND status IN ('COMPLETED', 'FAILED')
-            ORDER BY completed_at DESC NULLS LAST, created_at DESC
+            ORDER BY COALESCE(completed_at, created_at) DESC, id DESC
             LIMIT 1
             """,
-            {'source_id': source_id}
+            {"source_id": source_id},
         )
-        
-        # If no previous job, schedule immediately
+
         if not last_job:
-            logger.info(
-                f"Source {source_id} ({source_name}) has no previous jobs, scheduling"
-            )
+            logger.info("Source %s (%s) has no previous finished jobs, scheduling", source_id, label)
             return True
-        
-        # Check if enough time has passed since last job
-        interval_hours = source.get('crawl_interval_hours') or self.default_interval_hours
-        
-        # Use completed_at if available, otherwise use created_at
-        last_time = last_job.get('completed_at') or last_job['created_at']
-        
+
+        interval_hours = source.get("crawl_interval_hours") or self.default_interval_hours
+        last_time = last_job.get("completed_at") or last_job.get("created_at")
+
         if not last_time:
-            logger.warning(
-                f"Source {source_id} ({source_name}) has job without timestamp, scheduling"
-            )
+            logger.warning("Source %s (%s) last job %s has no timestamp, scheduling", source_id, label, last_job["id"])
             return True
-        
-        # Calculate time since last job
-        now = datetime.now(timezone.utc)
-        
-        # Ensure last_time is timezone-aware
+
+        now = last_job.get("db_now") or datetime.now(timezone.utc)
         if last_time.tzinfo is None:
             last_time = last_time.replace(tzinfo=timezone.utc)
-        
-        elapsed_hours = (now - last_time).total_seconds() / 3600
-        
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
+        elapsed_hours = (now - last_time).total_seconds() / 3600.0
+
         if elapsed_hours >= interval_hours:
             logger.info(
-                f"Source {source_id} ({source_name}): {elapsed_hours:.1f}h since last crawl "
-                f"(interval: {interval_hours}h), scheduling"
+                "Source %s (%s): %.2fh since last %s job %s (interval: %sh), scheduling",
+                source_id, label, elapsed_hours, last_job["status"], last_job["id"], interval_hours,
             )
             return True
-        else:
-            remaining_hours = interval_hours - elapsed_hours
-            logger.debug(
-                f"Source {source_id} ({source_name}): {remaining_hours:.1f}h until next crawl"
-            )
-            return False
-    
-    def _create_job(self, source: Dict[str, Any]):
+
+        remaining_hours = interval_hours - elapsed_hours
+        logger.debug("Source %s (%s): %.2fh until next crawl", source_id, label, remaining_hours)
+        return False
+
+    def _create_job(self, source: Dict[str, Any]) -> Optional[int]:
+        """Insert a new PENDING job. Safe under concurrent schedulers.
+
+        Uses ``ON CONFLICT DO NOTHING`` against the partial unique index
+        ``(source_id) WHERE status IN ('PENDING', 'RUNNING')`` so two schedulers
+        racing for the same source produce at most one job without throwing an error.
+
+        Returns:
+            Created job ID, or None if another scheduler/API created an active job first.
         """
-        Create a new crawl job for the source.
-        
-        Args:
-            source: Source dictionary with id and name
-        """
-        source_id = source['id']
-        source_name = source['name']
-        
+        source_id = source["id"]
+        label = source["base_url"]
+
         try:
-            result = self.database.execute_one(
-                """
-                INSERT INTO crawl_jobs (
-                    source_id,
-                    status,
-                    run_after,
-                    attempt_no,
-                    created_at
-                )
-                VALUES (
-                    %(source_id)s,
-                    'PENDING',
-                    NOW(),
-                    0,
-                    NOW()
-                )
-                RETURNING id, created_at
-                """,
-                {'source_id': source_id}
-            )
-            
-            job_id = result['id']
-            created_at = result['created_at']
-            
-            logger.info(
-                f"Created job {job_id} for source {source_id} ({source_name}) at {created_at}"
-            )
-            
-        except Exception as e:
-            # Check if it's a unique constraint violation (another process created the job)
-            if 'unique' in str(e).lower() or 'duplicate' in str(e).lower():
-                logger.info(
-                    f"Job already exists for source {source_id} ({source_name}), skipping"
-                )
-            else:
-                raise DatabaseError(
-                    f"Failed to create job for source {source_id}: {e}"
-                ) from e
+            with self.database.transaction() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO crawl_jobs (
+                            source_id,
+                            status,
+                            run_after,
+                            attempt_no,
+                            created_at
+                        )
+                        VALUES (
+                            %(source_id)s,
+                            'PENDING',
+                            clock_timestamp(),
+                            0,
+                            clock_timestamp()
+                        )
+                        ON CONFLICT (source_id) WHERE status IN ('PENDING', 'RUNNING')
+                        DO NOTHING
+                        RETURNING id, created_at
+                        """,
+                        {"source_id": source_id},
+                    )
+                    row = cur.fetchone()
+        except DatabaseError as e:
+            cause = e.__cause__
+            if isinstance(cause, psycopg.errors.UniqueViolation):
+                logger.info("Active job already exists for source %s (%s), skipping", source_id, label)
+                return None
+            raise DatabaseError(f"Failed to create job for source {source_id}: {e}") from e
+
+        if not row:
+            logger.info("Active job already exists for source %s (%s), skipping", source_id, label)
+            return None
+
+        logger.info("Created job %s for source %s (%s) at %s", row["id"], source_id, label, row["created_at"])
+        return row["id"]
 
 
-def main():
+def main() -> None:
     """Scheduler entry point."""
-    # Configure logging
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    
     logger.info("UTC Crawler Scheduler starting...")
-    
+
     try:
-        # Load configuration
-        from .config import load_config
         config = load_config()
-        
-        # Create scheduler with default 6-hour interval
+        sched_cfg: SchedulerConfig = config.scheduler
         scheduler = CrawlScheduler(
             database=Database(config.database),
-            default_interval_hours=6,
-            check_interval_seconds=300,  # Check every 5 minutes
+            default_interval_hours=sched_cfg.default_interval_hours,
+            check_interval_seconds=sched_cfg.check_interval_seconds,
+            liveness_file=sched_cfg.liveness_file,
         )
-        
-        # Run scheduler
         scheduler.run()
-        
+    except SystemExit:
+        raise
     except Exception as e:
-        logger.error(f"Scheduler failed to start: {e}", exc_info=True)
+        logger.error("Scheduler failed to start: %s", e, exc_info=True)
         sys.exit(1)
 
 

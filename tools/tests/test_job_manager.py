@@ -1,21 +1,23 @@
-"""Tests for job manager."""
+"""Tests for JobManager: claiming, heartbeat, lease fencing, retry policy, reclaim, error sanitization."""
 
-import pytest
+import random
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, MagicMock
+from unittest.mock import MagicMock, Mock
 
-from src.job_manager import JobManager
+import pytest
+
 from src.database import Database
 from src.exceptions import (
     ClaimTokenMismatchError,
-    LeaseExpiredError,
     DatabaseError,
+    JobStateError,
+    LeaseExpiredError,
 )
+from src.job_manager import JobManager, RetryPolicy, sanitize_error_message
 
 
 def setup_mock_transaction(mock_db, mock_cursor):
-    """Helper to setup transaction and cursor context managers."""
     mock_conn = MagicMock()
     mock_db.transaction.return_value.__enter__ = MagicMock(return_value=mock_conn)
     mock_db.transaction.return_value.__exit__ = MagicMock(return_value=False)
@@ -26,177 +28,204 @@ def setup_mock_transaction(mock_db, mock_cursor):
 
 @pytest.fixture
 def mock_db():
-    """Create mock database."""
-    db = Mock(spec=Database)
-    return db
+    return Mock(spec=Database)
 
 
 @pytest.fixture
 def job_manager(mock_db):
-    """Create job manager with mock database."""
-    return JobManager(mock_db, lease_duration_minutes=10)
+    return JobManager(
+        mock_db,
+        lease_duration_seconds=600,
+        retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=900, max_delay_seconds=21600, jitter_ratio=0.0),
+    )
 
 
-def test_init(mock_db):
-    """Test job manager initialization."""
-    manager = JobManager(mock_db, lease_duration_minutes=15)
-    assert manager.db == mock_db
-    assert manager.lease_duration_minutes == 15
-    assert manager.current_job_id is None
-    assert manager.current_claim_token is None
+def test_retry_policy_exponential_backoff_cap_and_jitter():
+    policy = RetryPolicy(max_attempts=4, base_delay_seconds=600, max_delay_seconds=1800, jitter_ratio=0.0)
+    assert policy.should_retry(1) is True
+    assert policy.should_retry(3) is True
+    assert policy.should_retry(4) is False
+    assert policy.should_retry(1, retryable=False) is False
+    assert policy.delay_seconds(1) == 600
+    assert policy.delay_seconds(2) == 1200
+    assert policy.delay_seconds(3) == 1800  # capped
+    assert policy.delay_seconds(4) == 1800  # capped
+
+    jittered = RetryPolicy(max_attempts=3, base_delay_seconds=1000, max_delay_seconds=10000, jitter_ratio=0.2)
+    d = jittered.delay_seconds(1, rng=random.Random(42))
+    assert 800 <= d <= 1200
+
+
+def test_sanitize_error_message_redacts_secrets_and_truncates():
+    msg = "Failed connecting to https://alice:supersecret@db.internal/app token=abc123 Bearer xyz.999"
+    cleaned = sanitize_error_message(msg)
+    assert "supersecret" not in cleaned
+    assert "abc123" not in cleaned
+    assert "xyz.999" not in cleaned
+    assert "***" in cleaned
+
+    long_msg = "a" * 3000
+    truncated = sanitize_error_message(long_msg, limit=200)
+    assert len(truncated) <= 200
+    assert truncated.endswith("[truncated]")
 
 
 def test_claim_job_success(job_manager, mock_db):
-    """Test successful job claiming."""
     mock_cursor = MagicMock()
     setup_mock_transaction(mock_db, mock_cursor)
-
-    claim_token = uuid.uuid4()
-    lease_until = datetime.now(timezone.utc) + timedelta(minutes=10)
-
+    token = uuid.uuid4()
     mock_cursor.fetchone.return_value = {
         "id": 123,
         "source_id": 456,
         "status": "RUNNING",
-        "claim_token": claim_token,
-        "lease_until": lease_until,
+        "claim_token": token,
+        "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10),
         "attempt_no": 1,
     }
-
-    result = job_manager.claim_job()
-
-    assert result is not None
-    assert result["id"] == 123
-    assert job_manager.current_job_id == 123
-    assert job_manager.current_claim_token == claim_token
+    job = job_manager.claim_job()
+    assert job["id"] == 123
+    assert job["claim_token"] == token
 
 
 def test_claim_job_none_available(job_manager, mock_db):
-    """Test claiming when no jobs available."""
     mock_cursor = MagicMock()
     setup_mock_transaction(mock_db, mock_cursor)
     mock_cursor.fetchone.return_value = None
-
-    result = job_manager.claim_job()
-
-    assert result is None
-    assert job_manager.current_job_id is None
+    assert job_manager.claim_job() is None
 
 
-def test_claim_job_database_error(job_manager, mock_db):
-    """Test claim_job with database error."""
-    mock_db.transaction.side_effect = Exception("Connection lost")
-
-    with pytest.raises(DatabaseError, match="Job claiming failed"):
-        job_manager.claim_job()
-
-
-def test_heartbeat_success(job_manager, mock_db):
-    """Test successful heartbeat."""
+def test_heartbeat_success_and_failures(job_manager, mock_db):
     mock_cursor = MagicMock()
     setup_mock_transaction(mock_db, mock_cursor)
+    token = uuid.uuid4()
+    future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    mock_cursor.fetchone.return_value = {"lease_until": future}
+    assert job_manager.heartbeat(1, token) == future
 
-    claim_token = uuid.uuid4()
-    lease_until = datetime.now(timezone.utc) + timedelta(minutes=10)
-
-    mock_cursor.fetchone.return_value = {"id": 123, "lease_until": lease_until}
-
-    job_manager.heartbeat(123, claim_token)  # Should not raise
-
-
-def test_heartbeat_token_mismatch(job_manager, mock_db):
-    """Test heartbeat with token mismatch."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-
-    claim_token = uuid.uuid4()
-    different_token = uuid.uuid4()
-
+    # Token mismatch
     mock_cursor.fetchone.side_effect = [
-        None,  # UPDATE failed
-        {
-            "status": "RUNNING",
-            "claim_token": different_token,
-            "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10),
-        },
+        None,
+        {"status": "RUNNING", "claim_token": uuid.uuid4(), "lease_until": future, "db_now": datetime.now(timezone.utc)},
     ]
-
     with pytest.raises(ClaimTokenMismatchError):
-        job_manager.heartbeat(123, claim_token)
+        job_manager.heartbeat(1, token)
 
-
-def test_complete_job_success(job_manager, mock_db):
-    """Test successful job completion."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-
-    claim_token = uuid.uuid4()
-    job_manager.current_job_id = 123
-    job_manager.current_claim_token = claim_token
-
-    mock_cursor.fetchone.return_value = {"id": 123}
-
-    job_manager.complete_job(123, claim_token)
-
-    assert job_manager.current_job_id is None
-
-
-def test_fail_job_with_retry(job_manager, mock_db):
-    """Test fail_job that schedules retry."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-
-    claim_token = uuid.uuid4()
-
+    # Lease expired
+    now = datetime.now(timezone.utc)
     mock_cursor.fetchone.side_effect = [
-        {"attempt_no": 2},  # Still under max_attempts
-        {"id": 123},  # UPDATE successful
+        None,
+        {"status": "RUNNING", "claim_token": token, "lease_until": now - timedelta(seconds=5), "db_now": now},
     ]
+    with pytest.raises(LeaseExpiredError):
+        job_manager.heartbeat(1, token)
 
-    job_manager.fail_job(123, claim_token, "Network timeout", max_attempts=5)
 
-
-def test_reclaim_expired_jobs_success(job_manager, mock_db):
-    """Test reclaiming expired jobs."""
+def test_complete_job_checks_lease_and_sets_completed_at(job_manager, mock_db):
     mock_cursor = MagicMock()
     setup_mock_transaction(mock_db, mock_cursor)
+    token = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    mock_cursor.fetchone.return_value = {"id": 10, "completed_at": now}
 
-    mock_cursor.fetchall.return_value = [
-        {"id": 100, "source_id": 1},
-        {"id": 101, "source_id": 2},
+    job_manager.complete_job(10, token)
+    sql = mock_cursor.execute.call_args[0][0]
+    assert "completed_at = clock_timestamp()" in sql
+    assert "lease_until > clock_timestamp()" in sql
+
+    # Expired lease -> LeaseExpiredError (not silent completion!)
+    mock_cursor.fetchone.side_effect = [
+        None,
+        {"status": "RUNNING", "claim_token": token, "lease_until": now - timedelta(seconds=1), "db_now": now},
     ]
+    with pytest.raises(LeaseExpiredError):
+        job_manager.complete_job(10, token)
+
+    # Token mismatch -> ClaimTokenMismatchError
+    mock_cursor.fetchone.side_effect = [
+        None,
+        {"status": "RUNNING", "claim_token": uuid.uuid4(), "lease_until": now + timedelta(minutes=5), "db_now": now},
+    ]
+    with pytest.raises(ClaimTokenMismatchError):
+        job_manager.complete_job(10, token)
+
+
+def test_fail_job_retry_permanent_and_lease_expired(job_manager, mock_db):
+    mock_cursor = MagicMock()
+    setup_mock_transaction(mock_db, mock_cursor)
+    token = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(minutes=5)
+
+    # Attempt 1 -> retry (PENDING) and stores error_message
+    mock_cursor.fetchone.side_effect = [
+        {"id": 5, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now},
+        {"run_after": future},
+    ]
+    outcome = job_manager.fail_job(5, token, "Timeout connecting to site")
+    assert outcome == "PENDING"
+    update_sql = mock_cursor.execute.call_args_list[1][0][0]
+    assert "error_message = %(msg)s" in update_sql
+    assert "FOR UPDATE" in mock_cursor.execute.call_args_list[0][0][0]
+
+    # Attempt 3 (max_attempts=3) -> FAILED with completed_at and error_message
+    mock_cursor.execute.reset_mock()
+    mock_cursor.fetchone.side_effect = [
+        {"id": 5, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 3, "db_now": now},
+        {"id": 5},
+    ]
+    outcome = job_manager.fail_job(5, token, "Still failing")
+    assert outcome == "FAILED"
+    update_sql = mock_cursor.execute.call_args_list[1][0][0]
+    assert "status = 'FAILED'" in update_sql
+    assert "completed_at = clock_timestamp()" in update_sql
+    assert "error_message = %(msg)s" in update_sql
+
+    # Non-retryable on attempt 1 -> immediate FAILED
+    mock_cursor.fetchone.side_effect = [
+        {"id": 5, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now},
+        {"id": 5},
+    ]
+    assert job_manager.fail_job(5, token, "Source not found", retryable=False) == "FAILED"
+
+    # Lease expired -> raises LeaseExpiredError, refuses to update
+    mock_cursor.fetchone.side_effect = [
+        {"id": 5, "status": "RUNNING", "claim_token": token, "lease_until": now - timedelta(seconds=1), "attempt_no": 1, "db_now": now},
+    ]
+    with pytest.raises(LeaseExpiredError):
+        job_manager.fail_job(5, token, "Late failure")
+
+
+def test_reclaim_expired_jobs_respects_max_attempts(job_manager, mock_db):
+    mock_cursor = MagicMock()
+    setup_mock_transaction(mock_db, mock_cursor)
+    now = datetime.now(timezone.utc)
+    mock_cursor.fetchall.return_value = [
+        {"id": 100, "attempt_no": 1, "lease_until": now - timedelta(minutes=2)},
+        {"id": 101, "attempt_no": 3, "lease_until": now - timedelta(minutes=2)},
+    ]
+    mock_cursor.rowcount = 1
 
     count = job_manager.reclaim_expired_jobs()
-
     assert count == 2
+    # Job 100 -> PENDING, Job 101 (attempt 3 >= max 3) -> FAILED
+    sqls = [c[0][0] for c in mock_cursor.execute.call_args_list]
+    assert "FOR UPDATE SKIP LOCKED" in sqls[0]
+    assert "status = 'PENDING'" in sqls[1]
+    assert "status = 'FAILED'" in sqls[2]
 
 
-def test_verify_ownership_success(job_manager, mock_db):
-    """Test successful ownership verification."""
-    claim_token = uuid.uuid4()
-    db_now = datetime.now(timezone.utc)
-    lease_until = db_now + timedelta(minutes=10)
+def test_verify_ownership_success_and_errors(job_manager, mock_db):
+    mock_cursor = MagicMock()
+    setup_mock_transaction(mock_db, mock_cursor)
+    token = uuid.uuid4()
+    now = datetime.now(timezone.utc)
 
-    mock_db.execute_one.return_value = {
-        "status": "RUNNING",
-        "claim_token": claim_token,
-        "lease_until": lease_until,
-        "db_now": db_now,
-    }
+    mock_cursor.fetchone.return_value = {"?column?": 1}
+    job_manager.verify_ownership(123, token)
 
-    job_manager.verify_ownership(123, claim_token)  # Should not raise
-
-
-def test_verify_ownership_token_mismatch(job_manager, mock_db):
-    """Test verify_ownership with token mismatch."""
-    claim_token = uuid.uuid4()
-    different_token = uuid.uuid4()
-
-    mock_db.execute_one.return_value = {
-        "status": "RUNNING",
-        "claim_token": different_token,
-        "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10),
-    }
-
-    with pytest.raises(ClaimTokenMismatchError):
-        job_manager.verify_ownership(123, claim_token)
+    mock_cursor.fetchone.side_effect = [
+        None,
+        {"status": "COMPLETED", "claim_token": token, "lease_until": None, "db_now": now},
+    ]
+    with pytest.raises(JobStateError):
+        job_manager.verify_ownership(123, token)

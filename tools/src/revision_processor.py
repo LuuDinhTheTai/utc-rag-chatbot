@@ -1,32 +1,58 @@
-"""Document revision processing with atomic fencing and integrity verification.
+"""Document revision processing with atomic ownership fencing and integrity verification.
 
-Implements AD-003, AD-007, AD-010, AD-011, AD-012, AD-013.
+Invariants:
+1. Every database write checks job ownership (``status = 'RUNNING'``, matching
+   ``claim_token``, and ``lease_until > clock_timestamp()``) in the **same
+   transaction** via ``JobManager.lock_owned_job``.
+2. Pipeline keys reflect the actual extractor version (``html-v2``, ``pdf-v3``,
+   ``docx-v2``). Unsupported types (including legacy ``.doc``) are rejected.
+3. Empty extracted text or zero chunks are rejected with ``EmptyContentError``
+   before creating a revision (never leaves an empty PENDING/INDEXING revision).
+4. Existing revisions with the same ``(document_id, content_hash, pipeline_key,
+   embedding_model)`` are handled by status:
+   - ``PENDING`` / ``PUBLISHED``: reuse (unchanged).
+   - ``REVOKED`` / ``ARCHIVED``: respect editorial state; do not resurrect.
+   - ``INDEXING``: if owned by a live job with unexpired lease, skip; otherwise
+     safely reclaim by rotating ``indexing_claim_token`` and re-indexing.
+5. Chunk insertion replaces any prior partial chunks for our own ``INDEXING``
+   revision inside the fenced transaction, and completion verifies count,
+   contiguous 0..N-1 positions, and non-empty body/embedding before transitioning
+   ``INDEXING -> PENDING``.
 """
 
 import logging
 import uuid
-from typing import Dict, List, Any, Optional, Tuple
-from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-from .database import Database
-from .hash_utils import compute_content_hash
 from .chunker import Chunker
+from .database import Database
 from .embedder import OllamaEmbedder
-from .job_manager import JobManager
 from .exceptions import (
-    DatabaseError,
-    LeaseExpiredError,
-    ClaimTokenMismatchError,
     ChunkCountMismatchError,
+    ClaimTokenMismatchError,
+    DatabaseError,
+    EmptyContentError,
+    OwnershipLostError,
+    ShutdownRequested,
+    UnsupportedContentTypeError,
 )
+from .hash_utils import compute_content_hash
+from .job_context import JobContext
+from .job_manager import JobManager
 
 logger = logging.getLogger(__name__)
 
+# Pipeline keys — bump version whenever extraction/chunking semantics change
+PIPELINE_HTML = "html-v2"
+PIPELINE_PDF = "pdf-v3"
+PIPELINE_DOCX = "docx-v2"
 
-# Pipeline keys per AD-008
-PIPELINE_HTML = "html-v1"
-PIPELINE_PDF = "pdf-v2"
-PIPELINE_DOCX = "docx-v1"
+_CONTENT_TYPE_TO_PIPELINE = {
+    "text/html": PIPELINE_HTML,
+    "application/xhtml+xml": PIPELINE_HTML,
+    "application/pdf": PIPELINE_PDF,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": PIPELINE_DOCX,
+}
 
 
 class RevisionProcessor:
@@ -39,21 +65,26 @@ class RevisionProcessor:
         job_manager: JobManager,
         embedding_model: str,
         chunker: Optional[Chunker] = None,
+        auto_publish: bool = False,
     ):
-        """Initialize revision processor.
-
-        Args:
-            database: Database connection manager
-            embedder: Ollama embedding client
-            job_manager: Job manager for ownership verification
-            embedding_model: Embedding model name (e.g., 'embeddinggemma:300m-qat-q4_0')
-            chunker: Text chunker (creates default if None)
-        """
         self.db = database
         self.embedder = embedder
         self.job_manager = job_manager
         self.embedding_model = embedding_model
         self.chunker = chunker or Chunker()
+        self.auto_publish = auto_publish
+
+    def _get_pipeline_key(self, content_type: str) -> str:
+        """Map MIME content type to pipeline key; reject legacy .doc and unknown types."""
+        mime = (content_type or "").split(";", 1)[0].strip().lower()
+        if mime == "application/msword":
+            raise UnsupportedContentTypeError(
+                "Legacy .doc (application/msword) is not supported; only .docx is supported"
+            )
+        key = _CONTENT_TYPE_TO_PIPELINE.get(mime)
+        if not key:
+            raise UnsupportedContentTypeError(f"Unsupported content type for pipeline: {content_type!r}")
+        return key
 
     def process_document(
         self,
@@ -64,561 +95,489 @@ class RevisionProcessor:
         extracted_text: str,
         content_type: str,
         source_id: int,
+        *,
+        campus_id: Optional[int] = None,
+        admission_year: Optional[int] = None,
+        job_context: Optional[JobContext] = None,
     ) -> Dict[str, Any]:
-        """Process document: detect changes, create revision, generate embeddings, persist chunks.
-
-        Implements AD-003 (revision lifecycle), AD-007 (content hashing),
-        AD-010 (revision ownership), AD-011 (atomic fencing), AD-012 (integrity verification).
-
-        Args:
-            job_id: Current job ID
-            job_claim_token: Job claim token for verification
-            canonical_url: Document canonical URL
-            title: Document title
-            extracted_text: Extracted text content
-            content_type: MIME type (text/html, application/pdf, etc.)
-            source_id: Crawl source ID
+        """Process one extracted document end-to-end.
 
         Returns:
-            Dict with keys: document_id, revision_id, chunks_created, content_changed
-
-        Raises:
-            LeaseExpiredError: If job lease expired
-            ClaimTokenMismatchError: If tokens don't match
-            ChunkCountMismatchError: If chunk integrity verification fails
-            DatabaseError: If database operation fails
+            Dict with keys ``document_id``, ``revision_id``, ``chunks_created``,
+            ``content_changed``, ``document_created``, ``skipped_reason``.
         """
-        # Step 1: Compute content hash per AD-007
-        content_hash = compute_content_hash(extracted_text)
+        if job_context:
+            job_context.checkpoint()
+
+        if not extracted_text or not extracted_text.strip():
+            raise EmptyContentError(f"Empty extracted text for {canonical_url}")
+
         pipeline_key = self._get_pipeline_key(content_type)
+        chunks = self.chunker.chunk_text(extracted_text)
+        if not chunks:
+            raise EmptyContentError(f"Chunker produced 0 chunks for {canonical_url}")
+
+        content_hash = compute_content_hash(extracted_text)
+        clean_title = (title or "Untitled").strip()[:500] or "Untitled"
 
         logger.info(
-            f"Processing document: url={canonical_url}, hash={content_hash[:12]}..., pipeline={pipeline_key}"
+            "Processing document: url=%s, hash=%s..., pipeline=%s, chunks=%d",
+            canonical_url, content_hash[:12], pipeline_key, len(chunks),
         )
 
-        # Step 2: Find or create knowledge_document
-        document_id = self._get_or_create_document(canonical_url, source_id)
-
-        # Step 3: Check for unchanged content (skip embedding if duplicate)
-        existing_revision = self._find_existing_revision(
-            document_id, content_hash, pipeline_key, self.embedding_model
+        # Atomic Step 1: verify job ownership, ensure document exists, inspect or acquire revision
+        doc_id, doc_created, existing_status, revision_id, indexing_token = (
+            self._acquire_revision(
+                job_id=job_id,
+                job_claim_token=job_claim_token,
+                canonical_url=canonical_url,
+                source_id=source_id,
+                title=clean_title,
+                content_hash=content_hash,
+                pipeline_key=pipeline_key,
+                expected_count=len(chunks),
+                campus_id=campus_id,
+                admission_year=admission_year,
+            )
         )
 
-        if existing_revision:
+        if existing_status is not None:
             logger.info(
-                f"Content unchanged for document {document_id}, "
-                f"reusing revision {existing_revision['id']}"
+                "Skipping re-indexing for document %s (revision %s, status=%s)",
+                doc_id, revision_id, existing_status,
             )
             return {
-                "document_id": document_id,
-                "revision_id": existing_revision["id"],
+                "document_id": doc_id,
+                "revision_id": revision_id,
                 "chunks_created": 0,
                 "content_changed": False,
+                "document_created": doc_created,
+                "skipped_reason": existing_status.lower(),
             }
 
-        # Step 4: Create new revision with status=INDEXING
-        revision_id, indexing_claim_token = self._create_revision(
-            job_id=job_id,
-            job_claim_token=job_claim_token,
-            document_id=document_id,
-            canonical_url=canonical_url,
-            title=title,
-            content_hash=content_hash,
-            pipeline_key=pipeline_key,
-        )
+        assert revision_id is not None and indexing_token is not None
 
         try:
-            # Step 5: Chunk text
-            chunks = self.chunker.chunk_text(extracted_text)
-            logger.info(
-                f"Chunked document into {len(chunks)} chunks for revision {revision_id}"
-            )
+            # Step 2: Generate embeddings OUTSIDE any DB transaction (no locks held)
+            chunk_bodies = [c["body"] for c in chunks]
+            embeddings = self.embedder.embed_batch(chunk_bodies, job_context=job_context)
 
-            # Step 6: Set expected_chunk_count for integrity verification (AD-012)
-            self._set_expected_chunk_count(
-                revision_id=revision_id,
-                indexing_claim_token=indexing_claim_token,
-                expected_count=len(chunks),
-            )
+            if len(embeddings) != len(chunks):
+                raise ChunkCountMismatchError(
+                    f"Embedder returned {len(embeddings)} vectors for {len(chunks)} chunks"
+                )
 
-            # Step 7: Generate embeddings and insert chunks with atomic fencing (AD-011)
-            self._embed_and_insert_chunks(
+            if job_context:
+                job_context.checkpoint()
+
+            embedded_chunks = [
+                {
+                    "revision_id": revision_id,
+                    "position": chunk["position"],
+                    "body": chunk["body"],
+                    "embedding": embedding,
+                }
+                for chunk, embedding in zip(chunks, embeddings)
+            ]
+
+            # Step 3: Insert chunks + verify integrity + transition INDEXING -> PENDING
+            # in a single short fenced transaction.
+            self._persist_chunks_and_complete(
                 job_id=job_id,
                 job_claim_token=job_claim_token,
                 revision_id=revision_id,
-                indexing_claim_token=indexing_claim_token,
-                chunks=chunks,
-            )
-
-            # Step 8: Verify chunk integrity and transition to PENDING (AD-012)
-            self._complete_indexing(
-                job_id=job_id,
-                job_claim_token=job_claim_token,
-                revision_id=revision_id,
-                indexing_claim_token=indexing_claim_token,
+                indexing_claim_token=indexing_token,
+                embedded_chunks=embedded_chunks,
                 expected_count=len(chunks),
             )
 
             logger.info(
-                f"Successfully processed revision {revision_id} with {len(chunks)} chunks"
+                "Successfully processed revision %s (doc=%s) with %d chunk(s)",
+                revision_id, doc_id, len(chunks),
             )
 
             return {
-                "document_id": document_id,
+                "document_id": doc_id,
                 "revision_id": revision_id,
                 "chunks_created": len(chunks),
                 "content_changed": True,
+                "document_created": doc_created,
+                "skipped_reason": None,
             }
 
+        except (OwnershipLostError, ShutdownRequested):
+            # Best-effort cleanup only if we still own the indexing_claim_token
+            self._cleanup_failed_revision(revision_id, indexing_token)
+            raise
         except Exception as e:
-            logger.error(
-                f"Failed to process revision {revision_id}: {e}, rolling back"
-            )
-            # Attempt cleanup (best effort, may fail if token invalid)
-            try:
-                self._cleanup_failed_revision(revision_id, indexing_claim_token)
-            except Exception as cleanup_error:
-                logger.warning(f"Cleanup failed: {cleanup_error}")
+            logger.error("Failed to process revision %s: %s; cleaning up", revision_id, e)
+            self._cleanup_failed_revision(revision_id, indexing_token)
             raise
 
-    def _get_pipeline_key(self, content_type: str) -> str:
-        """Determine pipeline key based on content type (AD-008)."""
-        if "html" in content_type.lower():
-            return PIPELINE_HTML
-        elif "pdf" in content_type.lower():
-            return PIPELINE_PDF
-        elif "docx" in content_type.lower() or "wordprocessingml" in content_type.lower():
-            return PIPELINE_DOCX
-        else:
-            # Default to HTML pipeline for unknown types
-            logger.warning(f"Unknown content type {content_type}, using {PIPELINE_HTML}")
-            return PIPELINE_HTML
-
-    def _get_or_create_document(
-        self, canonical_url: str, source_id: int
-    ) -> int:
-        """Find or create knowledge_document by canonical URL."""
-        try:
-            # Try to find existing document
-            result = self.db.execute_one(
-                """
-                SELECT id FROM knowledge_documents
-                WHERE canonical_url = %(url)s
-                """,
-                {"url": canonical_url},
-            )
-
-            if result:
-                return result["id"]
-
-            # Create new document
-            result = self.db.execute_one(
-                """
-                INSERT INTO knowledge_documents (canonical_url, crawl_source_id)
-                VALUES (%(url)s, %(source_id)s)
-                ON CONFLICT (canonical_url) DO UPDATE
-                SET crawl_source_id = EXCLUDED.crawl_source_id
-                RETURNING id
-                """,
-                {"url": canonical_url, "source_id": source_id},
-            )
-
-            logger.info(f"Created knowledge_document {result['id']} for {canonical_url}")
-            return result["id"]
-
-        except Exception as e:
-            raise DatabaseError(f"Failed to get/create document: {e}") from e
-
-    def _find_existing_revision(
+    def _acquire_revision(
         self,
-        document_id: int,
-        content_hash: str,
-        pipeline_key: str,
-        embedding_model: str,
-    ) -> Optional[Dict[str, Any]]:
-        """Check if revision with same content already exists."""
-        try:
-            return self.db.execute_one(
-                """
-                SELECT id, status
-                FROM document_revisions
-                WHERE document_id = %(doc_id)s
-                  AND content_hash = %(hash)s
-                  AND pipeline_key = %(pipeline)s
-                  AND embedding_model = %(model)s
-                LIMIT 1
-                """,
-                {
-                    "doc_id": document_id,
-                    "hash": content_hash,
-                    "pipeline": pipeline_key,
-                    "model": embedding_model,
-                },
-            )
-        except Exception as e:
-            raise DatabaseError(f"Failed to check existing revision: {e}") from e
-
-    def _create_revision(
-        self,
+        *,
         job_id: int,
         job_claim_token: uuid.UUID,
-        document_id: int,
         canonical_url: str,
+        source_id: int,
         title: str,
         content_hash: str,
         pipeline_key: str,
-    ) -> Tuple[int, uuid.UUID]:
-        """Create new revision with status=INDEXING and indexing_claim_token.
+        expected_count: int,
+        campus_id: Optional[int],
+        admission_year: Optional[int],
+    ) -> Tuple[int, bool, Optional[str], Optional[int], Optional[uuid.UUID]]:
+        """Atomically verify ownership, get-or-create document, and inspect/create/reclaim revision.
 
         Returns:
-            Tuple of (revision_id, indexing_claim_token)
+            ``(document_id, document_created, skipped_status, revision_id, indexing_token)``
+            When ``skipped_status`` is not None, caller should NOT index (``indexing_token`` is None).
         """
-        try:
-            with self.db.transaction() as conn:
-                with conn.cursor() as cur:
-                    # Verify job ownership first (AD-011)
-                    self.job_manager.verify_ownership(job_id, job_claim_token)
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                # 1. Lock and verify job ownership first (consistent lock order: jobs -> docs -> revisions)
+                self.job_manager.lock_owned_job(cur, job_id, job_claim_token)
 
-                    # Generate revision claim token (AD-010)
-                    indexing_claim_token = uuid.uuid4()
+                # 2. Get or create knowledge_document (uses INSERT ... ON CONFLICT DO NOTHING so
+                #    utc_worker does NOT need UPDATE privilege on knowledge_documents).
+                cur.execute(
+                    """
+                    INSERT INTO knowledge_documents (canonical_url, crawl_source_id)
+                    VALUES (%(url)s, %(source_id)s)
+                    ON CONFLICT (canonical_url) DO NOTHING
+                    RETURNING id
+                    """,
+                    {"url": canonical_url, "source_id": source_id},
+                )
+                inserted_doc = cur.fetchone()
+                if inserted_doc:
+                    document_id = inserted_doc["id"]
+                    document_created = True
+                else:
+                    cur.execute(
+                        "SELECT id FROM knowledge_documents WHERE canonical_url = %(url)s",
+                        {"url": canonical_url},
+                    )
+                    existing_doc = cur.fetchone()
+                    if not existing_doc:
+                        raise DatabaseError(f"Failed to locate knowledge_document for {canonical_url}")
+                    document_id = existing_doc["id"]
+                    document_created = False
 
-                    # Create revision
+                # 3. Try to insert a brand-new INDEXING revision; handle unique conflicts cleanly.
+                new_token = uuid.uuid4()
+                cur.execute(
+                    """
+                    INSERT INTO document_revisions (
+                        document_id,
+                        crawl_job_id,
+                        campus_id,
+                        admission_year,
+                        title,
+                        official_url,
+                        content_hash,
+                        pipeline_key,
+                        embedding_model,
+                        status,
+                        expected_chunk_count,
+                        indexing_claim_token,
+                        updated_at
+                    ) VALUES (
+                        %(doc_id)s,
+                        %(job_id)s,
+                        %(campus_id)s,
+                        %(admission_year)s,
+                        %(title)s,
+                        %(url)s,
+                        %(hash)s,
+                        %(pipeline)s,
+                        %(model)s,
+                        'INDEXING',
+                        %(expected_count)s,
+                        %(token)s,
+                        clock_timestamp()
+                    )
+                    ON CONFLICT (document_id, content_hash, pipeline_key, embedding_model)
+                    DO NOTHING
+                    RETURNING id
+                    """,
+                    {
+                        "doc_id": document_id,
+                        "job_id": job_id,
+                        "campus_id": campus_id,
+                        "admission_year": admission_year,
+                        "title": title,
+                        "url": canonical_url,
+                        "hash": content_hash,
+                        "pipeline": pipeline_key,
+                        "model": self.embedding_model,
+                        "expected_count": expected_count,
+                        "token": new_token,
+                    },
+                )
+                created_rev = cur.fetchone()
+                if created_rev:
+                    return document_id, document_created, None, created_rev["id"], new_token
+
+                # 4. Conflict: reload the existing revision FOR UPDATE and inspect its real status.
+                cur.execute(
+                    """
+                    SELECT
+                        r.id,
+                        r.status,
+                        r.crawl_job_id,
+                        r.indexing_claim_token,
+                        j.status AS owner_job_status,
+                        j.lease_until AS owner_lease_until,
+                        clock_timestamp() AS db_now
+                    FROM document_revisions r
+                    LEFT JOIN crawl_jobs j ON j.id = r.crawl_job_id
+                    WHERE r.document_id = %(doc_id)s
+                      AND r.content_hash = %(hash)s
+                      AND r.pipeline_key = %(pipeline)s
+                      AND r.embedding_model = %(model)s
+                    FOR UPDATE OF r
+                    """,
+                    {
+                        "doc_id": document_id,
+                        "hash": content_hash,
+                        "pipeline": pipeline_key,
+                        "model": self.embedding_model,
+                    },
+                )
+                existing_rev = cur.fetchone()
+                if not existing_rev:
+                    # Extremely rare: concurrent worker deleted its failed INDEXING revision between
+                    # ON CONFLICT and SELECT. Retry insert once.
                     cur.execute(
                         """
                         INSERT INTO document_revisions (
-                            document_id,
-                            crawl_job_id,
-                            title,
-                            official_url,
-                            content_hash,
-                            pipeline_key,
-                            embedding_model,
-                            status,
-                            indexing_claim_token,
-                            updated_at
+                            document_id, crawl_job_id, campus_id, admission_year,
+                            title, official_url, content_hash, pipeline_key,
+                            embedding_model, status, expected_chunk_count,
+                            indexing_claim_token, updated_at
                         ) VALUES (
-                            %(doc_id)s,
-                            %(job_id)s,
-                            %(title)s,
-                            %(url)s,
-                            %(hash)s,
-                            %(pipeline)s,
-                            %(model)s,
-                            'INDEXING',
-                            %(token)s,
-                            clock_timestamp()
+                            %(doc_id)s, %(job_id)s, %(campus_id)s, %(admission_year)s,
+                            %(title)s, %(url)s, %(hash)s, %(pipeline)s,
+                            %(model)s, 'INDEXING', %(expected_count)s,
+                            %(token)s, clock_timestamp()
                         )
                         RETURNING id
                         """,
                         {
                             "doc_id": document_id,
                             "job_id": job_id,
+                            "campus_id": campus_id,
+                            "admission_year": admission_year,
                             "title": title,
                             "url": canonical_url,
                             "hash": content_hash,
                             "pipeline": pipeline_key,
                             "model": self.embedding_model,
-                            "token": indexing_claim_token,
+                            "expected_count": expected_count,
+                            "token": new_token,
                         },
                     )
+                    retry_rev = cur.fetchone()
+                    return document_id, document_created, None, retry_rev["id"], new_token
 
-                    result = cur.fetchone()
-                    revision_id = result["id"]
+                rev_id = existing_rev["id"]
+                status = existing_rev["status"]
 
-                    logger.info(
-                        f"Created revision {revision_id} with indexing_claim_token"
+                if status in ("PENDING", "PUBLISHED", "ARCHIVED", "REVOKED"):
+                    return document_id, document_created, status, rev_id, None
+
+                if status == "INDEXING":
+                    owner_live = (
+                        existing_rev["crawl_job_id"] is not None
+                        and existing_rev["crawl_job_id"] != job_id
+                        and existing_rev["owner_job_status"] == "RUNNING"
+                        and existing_rev["owner_lease_until"] is not None
+                        and existing_rev["owner_lease_until"] > existing_rev["db_now"]
                     )
+                    if owner_live:
+                        logger.info(
+                            "Revision %s is actively being indexed by job %s; skipping",
+                            rev_id, existing_rev["crawl_job_id"],
+                        )
+                        return document_id, document_created, "INDEXING_BY_OTHER", rev_id, None
 
-                    return revision_id, indexing_claim_token
+                    # Abandoned / stuck INDEXING revision: take over safely with a fresh token
+                    logger.warning(
+                        "Reclaiming abandoned INDEXING revision %s (previous job=%s)",
+                        rev_id, existing_rev["crawl_job_id"],
+                    )
+                    cur.execute(
+                        "DELETE FROM document_chunks WHERE revision_id = %(rev_id)s",
+                        {"rev_id": rev_id},
+                    )
+                    cur.execute(
+                        """
+                        UPDATE document_revisions
+                        SET crawl_job_id = %(job_id)s,
+                            title = %(title)s,
+                            expected_chunk_count = %(expected_count)s,
+                            indexing_claim_token = %(token)s,
+                            updated_at = clock_timestamp()
+                        WHERE id = %(rev_id)s
+                          AND status = 'INDEXING'
+                        RETURNING id
+                        """,
+                        {
+                            "rev_id": rev_id,
+                            "job_id": job_id,
+                            "title": title,
+                            "expected_count": expected_count,
+                            "token": new_token,
+                        },
+                    )
+                    if not cur.fetchone():
+                        raise DatabaseError(f"Failed to reclaim INDEXING revision {rev_id}")
+                    return document_id, document_created, None, rev_id, new_token
 
-        except (LeaseExpiredError, ClaimTokenMismatchError):
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to create revision: {e}") from e
+                raise DatabaseError(f"Unexpected revision status {status!r} for revision {rev_id}")
 
-    def _set_expected_chunk_count(
+    def _persist_chunks_and_complete(
         self,
+        *,
+        job_id: int,
+        job_claim_token: uuid.UUID,
         revision_id: int,
         indexing_claim_token: uuid.UUID,
+        embedded_chunks: List[Dict[str, Any]],
         expected_count: int,
     ) -> None:
-        """Set expected_chunk_count for integrity verification (AD-012)."""
-        try:
-            result = self.db.execute_one(
-                """
-                UPDATE document_revisions
-                SET expected_chunk_count = %(count)s
-                WHERE id = %(rev_id)s
-                  AND indexing_claim_token = %(token)s
-                  AND status = 'INDEXING'
-                RETURNING id
-                """,
-                {
-                    "rev_id": revision_id,
-                    "count": expected_count,
-                    "token": indexing_claim_token,
-                },
-            )
+        """Atomically verify job + revision ownership, replace chunks, verify integrity,
+        and transition ``INDEXING -> PENDING``.
+        """
+        if expected_count <= 0 or not embedded_chunks:
+            raise EmptyContentError(f"Cannot complete revision {revision_id} with 0 chunks")
 
-            if not result:
-                raise ClaimTokenMismatchError(
-                    f"Cannot set expected_chunk_count for revision {revision_id}: token mismatch or wrong status"
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                # 1. Lock and verify job ownership (checks token, RUNNING, AND lease_until > clock_timestamp())
+                self.job_manager.lock_owned_job(cur, job_id, job_claim_token)
+
+                # 2. Lock and verify revision ownership
+                cur.execute(
+                    """
+                    SELECT document_id, crawl_job_id, indexing_claim_token, expected_chunk_count, status
+                    FROM document_revisions
+                    WHERE id = %(rev_id)s
+                    FOR UPDATE
+                    """,
+                    {"rev_id": revision_id},
+                )
+                rev_state = cur.fetchone()
+                if not rev_state:
+                    raise DatabaseError(f"Revision {revision_id} not found")
+                if rev_state["indexing_claim_token"] != indexing_claim_token:
+                    raise ClaimTokenMismatchError(
+                        f"Revision {revision_id} indexing token mismatch (reclaimed)"
+                    )
+                if rev_state["crawl_job_id"] != job_id:
+                    raise ClaimTokenMismatchError(
+                        f"Revision {revision_id} belongs to job {rev_state['crawl_job_id']}, not {job_id}"
+                    )
+                if rev_state["status"] != "INDEXING":
+                    raise DatabaseError(
+                        f"Revision {revision_id} status is {rev_state['status']}, expected INDEXING"
+                    )
+                if rev_state["expected_chunk_count"] != expected_count:
+                    raise ChunkCountMismatchError(
+                        f"Revision {revision_id} expected_chunk_count={rev_state['expected_chunk_count']} "
+                        f"!= {expected_count}"
+                    )
+
+                # 3. Replace any partial chunks cleanly (never blindly ignore conflicts)
+                cur.execute(
+                    "DELETE FROM document_chunks WHERE revision_id = %(rev_id)s",
+                    {"rev_id": revision_id},
                 )
 
-            logger.debug(
-                f"Set expected_chunk_count={expected_count} for revision {revision_id}"
-            )
+                cur.executemany(
+                    """
+                    INSERT INTO document_chunks (revision_id, position, body, embedding)
+                    VALUES (%(revision_id)s, %(position)s, %(body)s, %(embedding)s)
+                    """,
+                    embedded_chunks,
+                )
 
-        except ClaimTokenMismatchError:
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to set expected_chunk_count: {e}") from e
+                # 4. Integrity verification in database
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total,
+                        COUNT(DISTINCT position) AS unique_positions,
+                        MIN(position) AS min_pos,
+                        MAX(position) AS max_pos,
+                        COUNT(*) FILTER (WHERE length(trim(body)) = 0 OR embedding IS NULL) AS invalid_rows
+                    FROM document_chunks
+                    WHERE revision_id = %(rev_id)s
+                    """,
+                    {"rev_id": revision_id},
+                )
+                integrity = cur.fetchone()
 
-    def _embed_and_insert_chunks(
-        self,
-        job_id: int,
-        job_claim_token: uuid.UUID,
-        revision_id: int,
-        indexing_claim_token: uuid.UUID,
-        chunks: List[Dict[str, Any]],
-    ) -> None:
-        """Generate embeddings and insert chunks with atomic fencing (AD-011).
+                total = integrity["total"]
+                unique_positions = integrity["unique_positions"]
+                min_pos = integrity["min_pos"]
+                max_pos = integrity["max_pos"]
+                invalid_rows = integrity["invalid_rows"]
 
-        Phase 1: Compute embeddings OUTSIDE transaction (no locks held)
-        Phase 2: SHORT transaction with dual-token verification + INSERT
-        """
-        # Phase 1: Compute embeddings (5-10s, NO LOCKS)
-        logger.info(f"Generating embeddings for {len(chunks)} chunks (Phase 1)...")
-        embedded_chunks = []
-
-        for chunk in chunks:
-            try:
-                embedding = self.embedder.embed(chunk["body"])
-                embedded_chunks.append({
-                    "revision_id": revision_id,
-                    "position": chunk["position"],
-                    "body": chunk["body"],
-                    "embedding": embedding,
-                })
-            except Exception as e:
-                raise DatabaseError(
-                    f"Failed to generate embedding for chunk {chunk['position']}: {e}"
-                ) from e
-
-        logger.info(f"Embeddings generated, inserting chunks (Phase 2)...")
-
-        # Phase 2: SHORT transaction with dual verification and INSERT (AD-011)
-        try:
-            with self.db.transaction() as conn:
-                with conn.cursor() as cur:
-                    # Lock and verify job ownership (AD-013: jobs first)
-                    cur.execute(
-                        """
-                        SELECT claim_token, status, lease_until
-                        FROM crawl_jobs
-                        WHERE id = %(job_id)s
-                        FOR UPDATE
-                        """,
-                        {"job_id": job_id},
+                if invalid_rows > 0:
+                    raise ChunkCountMismatchError(
+                        f"Revision {revision_id}: {invalid_rows} chunk(s) have empty body or null embedding"
+                    )
+                if total != expected_count:
+                    raise ChunkCountMismatchError(
+                        f"Revision {revision_id}: expected {expected_count} chunks, got {total}"
+                    )
+                if unique_positions != total:
+                    raise ChunkCountMismatchError(
+                        f"Revision {revision_id}: duplicate positions ({unique_positions} unique vs {total})"
+                    )
+                if min_pos != 0 or max_pos != expected_count - 1 or (max_pos - min_pos + 1) != total:
+                    raise ChunkCountMismatchError(
+                        f"Revision {revision_id}: non-contiguous positions (min={min_pos}, max={max_pos}, total={total})"
                     )
 
-                    job_state = cur.fetchone()
-
-                    if not job_state:
-                        raise DatabaseError(f"Job {job_id} not found")
-
-                    if job_state["claim_token"] != job_claim_token:
-                        raise ClaimTokenMismatchError(
-                            f"Job {job_id} claim token mismatch (job reclaimed)"
-                        )
-
-                    if job_state["status"] != "RUNNING":
-                        raise DatabaseError(
-                            f"Job {job_id} status is {job_state['status']}, expected RUNNING"
-                        )
-
-                    # Check lease validity with clock_timestamp() per AD-011
-                    cur.execute("SELECT clock_timestamp() as now")
-                    now = cur.fetchone()["now"]
-
-                    if job_state["lease_until"] and job_state["lease_until"] < now:
-                        raise LeaseExpiredError(
-                            f"Job {job_id} lease expired at {job_state['lease_until']}"
-                        )
-
-                    # Lock and verify revision ownership (AD-013: then revisions)
+                # 5. Transition INDEXING -> PUBLISHED (when auto_publish) or PENDING
+                if self.auto_publish:
+                    # Archive previous PUBLISHED/PENDING revisions FIRST so the partial unique
+                    # index `document_revisions (document_id) WHERE status = 'PUBLISHED'` is preserved.
                     cur.execute(
                         """
-                        SELECT crawl_job_id, indexing_claim_token, status
-                        FROM document_revisions
+                        UPDATE document_revisions
+                        SET status = 'ARCHIVED',
+                            updated_at = clock_timestamp()
+                        WHERE document_id = %(doc_id)s
+                          AND id <> %(rev_id)s
+                          AND status IN ('PENDING', 'PUBLISHED')
+                        """,
+                        {"doc_id": rev_state["document_id"], "rev_id": revision_id},
+                    )
+                    cur.execute(
+                        """
+                        UPDATE document_revisions
+                        SET status = 'PUBLISHED',
+                            source_verified = true,
+                            published_at = clock_timestamp(),
+                            indexing_claim_token = NULL,
+                            updated_at = clock_timestamp()
                         WHERE id = %(rev_id)s
-                        FOR UPDATE
+                          AND indexing_claim_token = %(token)s
+                          AND status = 'INDEXING'
+                        RETURNING id, document_id
                         """,
-                        {"rev_id": revision_id},
+                        {"rev_id": revision_id, "token": indexing_claim_token},
                     )
-
-                    rev_state = cur.fetchone()
-
-                    if not rev_state:
-                        raise DatabaseError(f"Revision {revision_id} not found")
-
-                    if rev_state["indexing_claim_token"] != indexing_claim_token:
+                    if not cur.fetchone():
                         raise ClaimTokenMismatchError(
-                            f"Revision {revision_id} indexing token mismatch (revision reclaimed)"
+                            f"Failed to transition revision {revision_id} to PUBLISHED: token mismatch"
                         )
-
-                    if rev_state["crawl_job_id"] != job_id:
-                        raise DatabaseError(
-                            f"Revision {revision_id} belongs to job {rev_state['crawl_job_id']}, not {job_id}"
-                        )
-
-                    if rev_state["status"] != "INDEXING":
-                        raise DatabaseError(
-                            f"Revision {revision_id} status is {rev_state['status']}, expected INDEXING"
-                        )
-
-                    # All verifications passed, insert chunks
-                    # Use ON CONFLICT to handle any duplicate position attempts
-                    for chunk in embedded_chunks:
-                        cur.execute(
-                            """
-                            INSERT INTO document_chunks (revision_id, position, body, embedding)
-                            VALUES (%(revision_id)s, %(position)s, %(body)s, %(embedding)s)
-                            ON CONFLICT (revision_id, position) DO NOTHING
-                            """,
-                            chunk,
-                        )
-
-                    logger.info(
-                        f"Inserted {len(embedded_chunks)} chunks for revision {revision_id}"
-                    )
-
-        except (LeaseExpiredError, ClaimTokenMismatchError):
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to insert chunks: {e}") from e
-
-    def _complete_indexing(
-        self,
-        job_id: int,
-        job_claim_token: uuid.UUID,
-        revision_id: int,
-        indexing_claim_token: uuid.UUID,
-        expected_count: int,
-    ) -> None:
-        """Verify chunk integrity and transition INDEXING → PENDING (AD-012).
-
-        Implements all integrity checks from AD-012:
-        - expected_chunk_count is set
-        - COUNT(*) = expected_chunk_count
-        - COUNT(DISTINCT position) = COUNT(*) (no duplicates)
-        - MIN(position) = 0
-        - MAX(position) = expected_count - 1
-        - MAX - MIN + 1 = COUNT (no gaps)
-        """
-        try:
-            with self.db.transaction() as conn:
-                with conn.cursor() as cur:
-                    # Verify job ownership (AD-013: jobs first)
-                    cur.execute(
-                        """
-                        SELECT claim_token, status, lease_until
-                        FROM crawl_jobs
-                        WHERE id = %(job_id)s
-                        FOR UPDATE
-                        """,
-                        {"job_id": job_id},
-                    )
-
-                    job_state = cur.fetchone()
-
-                    if not job_state or job_state["claim_token"] != job_claim_token:
-                        raise ClaimTokenMismatchError(
-                            f"Job {job_id} claim token mismatch during completion"
-                        )
-
-                    if job_state["status"] != "RUNNING":
-                        raise DatabaseError(f"Job {job_id} not in RUNNING state")
-
-                    # Lock revision
-                    cur.execute(
-                        """
-                        SELECT indexing_claim_token, expected_chunk_count, status
-                        FROM document_revisions
-                        WHERE id = %(rev_id)s
-                        FOR UPDATE
-                        """,
-                        {"rev_id": revision_id},
-                    )
-
-                    rev_state = cur.fetchone()
-
-                    if not rev_state:
-                        raise DatabaseError(f"Revision {revision_id} not found")
-
-                    if rev_state["indexing_claim_token"] != indexing_claim_token:
-                        raise ClaimTokenMismatchError(
-                            f"Revision {revision_id} token mismatch during completion"
-                        )
-
-                    if rev_state["status"] != "INDEXING":
-                        raise DatabaseError(
-                            f"Revision {revision_id} not in INDEXING state"
-                        )
-
-                    if rev_state["expected_chunk_count"] is None:
-                        raise ChunkCountMismatchError(
-                            f"Revision {revision_id} expected_chunk_count not set"
-                        )
-
-                    # Perform integrity verification (AD-012)
-                    cur.execute(
-                        """
-                        SELECT
-                            COUNT(*) as total,
-                            COUNT(DISTINCT position) as unique_positions,
-                            MIN(position) as min_pos,
-                            MAX(position) as max_pos
-                        FROM document_chunks
-                        WHERE revision_id = %(rev_id)s
-                        """,
-                        {"rev_id": revision_id},
-                    )
-
-                    integrity = cur.fetchone()
-
-                    total = integrity["total"]
-                    unique_positions = integrity["unique_positions"]
-                    min_pos = integrity["min_pos"]
-                    max_pos = integrity["max_pos"]
-
-                    # All integrity checks from AD-012
-                    if total != expected_count:
-                        raise ChunkCountMismatchError(
-                            f"Revision {revision_id}: expected {expected_count} chunks, got {total}"
-                        )
-
-                    if unique_positions != total:
-                        raise ChunkCountMismatchError(
-                            f"Revision {revision_id}: duplicate positions detected ({unique_positions} unique, {total} total)"
-                        )
-
-                    if min_pos != 0:
-                        raise ChunkCountMismatchError(
-                            f"Revision {revision_id}: min position is {min_pos}, expected 0"
-                        )
-
-                    if max_pos != expected_count - 1:
-                        raise ChunkCountMismatchError(
-                            f"Revision {revision_id}: max position is {max_pos}, expected {expected_count - 1}"
-                        )
-
-                    if max_pos - min_pos + 1 != total:
-                        raise ChunkCountMismatchError(
-                            f"Revision {revision_id}: gaps detected in positions"
-                        )
-
-                    # All checks passed, transition to PENDING (AD-003)
+                else:
                     cur.execute(
                         """
                         UPDATE document_revisions
@@ -627,39 +586,120 @@ class RevisionProcessor:
                             updated_at = clock_timestamp()
                         WHERE id = %(rev_id)s
                           AND indexing_claim_token = %(token)s
-                        RETURNING id
+                          AND status = 'INDEXING'
+                        RETURNING id, document_id
                         """,
                         {"rev_id": revision_id, "token": indexing_claim_token},
                     )
-
-                    result = cur.fetchone()
-
-                    if not result:
+                    transitioned = cur.fetchone()
+                    if not transitioned:
                         raise ClaimTokenMismatchError(
                             f"Failed to transition revision {revision_id} to PENDING: token mismatch"
                         )
 
-                    logger.info(
-                        f"Revision {revision_id} completed indexing: {total} chunks verified, transitioned to PENDING"
+                    # Mark older unreviewed PENDING revisions of the same document as ARCHIVED
+                    # (keeps any live PUBLISHED revision intact until admin publishes this new one).
+                    cur.execute(
+                        """
+                        UPDATE document_revisions
+                        SET status = 'ARCHIVED',
+                            updated_at = clock_timestamp()
+                        WHERE document_id = %(doc_id)s
+                          AND id <> %(rev_id)s
+                          AND status = 'PENDING'
+                        """,
+                        {"doc_id": transitioned["document_id"], "rev_id": revision_id},
                     )
 
-        except (LeaseExpiredError, ClaimTokenMismatchError, ChunkCountMismatchError):
-            raise
-        except Exception as e:
-            raise DatabaseError(f"Failed to complete indexing: {e}") from e
+    def archive_document_revisions(
+        self,
+        job_id: int,
+        job_claim_token: uuid.UUID,
+        canonical_url: str,
+        reason: str = "Source removed",
+    ) -> int:
+        """Archive active (PENDING/PUBLISHED) revisions for a deleted URL (e.g. HTTP 404/410).
+
+        Fenced by ``lock_owned_job`` so a stale worker cannot archive revisions.
+        """
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                self.job_manager.lock_owned_job(cur, job_id, job_claim_token)
+                cur.execute(
+                    "SELECT id FROM knowledge_documents WHERE canonical_url = %(url)s",
+                    {"url": canonical_url},
+                )
+                doc = cur.fetchone()
+                if not doc:
+                    return 0
+
+                cur.execute(
+                    """
+                    UPDATE document_revisions
+                    SET status = 'ARCHIVED',
+                        updated_at = clock_timestamp()
+                    WHERE document_id = %(doc_id)s
+                      AND status IN ('PENDING', 'PUBLISHED')
+                    RETURNING id
+                    """,
+                    {"doc_id": doc["id"]},
+                )
+                archived = cur.fetchall()
+                if archived:
+                    logger.info(
+                        "Archived %d revision(s) for removed URL %s (%s)",
+                        len(archived), canonical_url, reason,
+                    )
+                return len(archived)
+
+    def archive_missing_source_documents(
+        self,
+        job_id: int,
+        job_claim_token: uuid.UUID,
+        source_id: int,
+        active_canonical_urls: List[str],
+    ) -> int:
+        """Archive active revisions for documents of ``source_id`` no longer present
+        in a complete sitemap discovery pass.
+        """
+        if not active_canonical_urls:
+            return 0
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                self.job_manager.lock_owned_job(cur, job_id, job_claim_token)
+                cur.execute(
+                    """
+                    UPDATE document_revisions r
+                    SET status = 'ARCHIVED',
+                        updated_at = clock_timestamp()
+                    FROM knowledge_documents d
+                    WHERE r.document_id = d.id
+                      AND d.crawl_source_id = %(source_id)s
+                      AND NOT (d.canonical_url = ANY(%(active_urls)s))
+                      AND r.status IN ('PENDING', 'PUBLISHED')
+                    RETURNING r.id
+                    """,
+                    {"source_id": source_id, "active_urls": list(active_canonical_urls)},
+                )
+                archived = cur.fetchall()
+                if archived:
+                    logger.info(
+                        "Archived %d revision(s) for URLs removed from source %s sitemap",
+                        len(archived), source_id,
+                    )
+                return len(archived)
 
     def _cleanup_failed_revision(
         self, revision_id: int, indexing_claim_token: uuid.UUID
-    ) -> None:
-        """Clean up failed revision with token verification (HIGH-003 fix).
-        
-        Only deletes chunks/revision if we still own it. If revision was reclaimed
-        by another worker, cleanup is skipped to prevent data loss.
+    ) -> bool:
+        """Delete chunks and revision ONLY if we still own ``indexing_claim_token`` and status is INDEXING.
+
+        Returns:
+            True if cleaned up, False if skipped or cleanup failed.
         """
         try:
             with self.db.transaction() as conn:
                 with conn.cursor() as cur:
-                    # Verify we still own the revision before cleanup (HIGH-003 fix)
                     cur.execute(
                         """
                         SELECT id, indexing_claim_token, status
@@ -669,37 +709,26 @@ class RevisionProcessor:
                         """,
                         {"rev_id": revision_id},
                     )
-
                     rev_state = cur.fetchone()
-
                     if not rev_state:
-                        logger.warning(f"Revision {revision_id} not found during cleanup, skipping")
-                        return
-
-                    # Only proceed if we still own the revision
+                        return False
                     if rev_state["indexing_claim_token"] != indexing_claim_token:
                         logger.warning(
-                            f"Revision {revision_id} token changed during cleanup "
-                            f"(reclaimed by another worker), skipping to prevent data loss"
+                            "Skipping cleanup of revision %s: token changed (reclaimed by another worker)",
+                            revision_id,
                         )
-                        return
-
+                        return False
                     if rev_state["status"] != "INDEXING":
                         logger.warning(
-                            f"Revision {revision_id} status is {rev_state['status']} during cleanup, skipping"
+                            "Skipping cleanup of revision %s: status is %s (not INDEXING)",
+                            revision_id, rev_state["status"],
                         )
-                        return
+                        return False
 
-                    # Safe to delete - we still own the revision
                     cur.execute(
-                        """
-                        DELETE FROM document_chunks
-                        WHERE revision_id = %(rev_id)s
-                        """,
+                        "DELETE FROM document_chunks WHERE revision_id = %(rev_id)s",
                         {"rev_id": revision_id},
                     )
-
-                    # Delete revision
                     cur.execute(
                         """
                         DELETE FROM document_revisions
@@ -709,8 +738,11 @@ class RevisionProcessor:
                         """,
                         {"rev_id": revision_id, "token": indexing_claim_token},
                     )
-
-                    logger.info(f"Cleaned up failed revision {revision_id}")
-
+                    logger.info("Cleaned up failed INDEXING revision %s", revision_id)
+                    return True
         except Exception as e:
-            logger.warning(f"Cleanup of revision {revision_id} failed: {e}")
+            logger.error(
+                "Cleanup failed for INDEXING revision %s (may need later reclaim): %s",
+                revision_id, e,
+            )
+            return False

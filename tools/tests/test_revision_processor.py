@@ -1,555 +1,365 @@
-"""Unit tests for revision processor."""
+"""Tests for RevisionProcessor: ownership fencing, status filtering, conflict recovery, empty content, cleanup."""
+
+import uuid
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, Mock
 
 import pytest
-import uuid
-from unittest.mock import Mock, MagicMock, patch, call
-from datetime import datetime, timezone, timedelta
 
-from src.revision_processor import RevisionProcessor, PIPELINE_HTML, PIPELINE_PDF, PIPELINE_DOCX
+from src.chunker import Chunker
+from src.database import Database
+from src.embedder import OllamaEmbedder
 from src.exceptions import (
-    DatabaseError,
-    LeaseExpiredError,
-    ClaimTokenMismatchError,
     ChunkCountMismatchError,
+    ClaimTokenMismatchError,
+    EmptyContentError,
+    LeaseExpiredError,
+    UnsupportedContentTypeError,
+)
+from src.job_manager import JobManager
+from src.revision_processor import (
+    PIPELINE_DOCX,
+    PIPELINE_HTML,
+    PIPELINE_PDF,
+    RevisionProcessor,
 )
 
 
-def setup_mock_transaction(mock_db, mock_cursor):
-    """Helper to setup transaction and cursor context managers."""
+def _setup_tx(mock_db, mock_cursor):
     mock_conn = MagicMock()
-    mock_db.transaction.return_value.__enter__ = MagicMock(return_value=mock_conn)
-    mock_db.transaction.return_value.__exit__ = MagicMock(return_value=False)
-    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
-    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.cursor.return_value.__exit__.return_value = False
+    mock_db.transaction = MagicMock()
+    mock_db.transaction.return_value.__enter__.return_value = mock_conn
+    mock_db.transaction.return_value.__exit__.return_value = False
     return mock_conn
 
 
 @pytest.fixture
 def mock_db():
-    """Create mock database."""
-    db = Mock()
-    db.transaction = MagicMock()
-    return db
+    return Mock(spec=Database)
 
 
 @pytest.fixture
 def mock_embedder():
-    """Create mock embedder."""
-    embedder = Mock()
-    embedder.embed.return_value = [0.1] * 768  # Valid 768-dim embedding
-    return embedder
+    emb = Mock(spec=OllamaEmbedder)
+    emb.embed_batch.side_effect = lambda texts, job_context=None: [[0.1] * 768 for _ in texts]
+    return emb
 
 
 @pytest.fixture
-def mock_job_manager():
-    """Create mock job manager."""
-    return Mock()
+def job_manager(mock_db):
+    return JobManager(mock_db, lease_duration_seconds=600)
 
 
 @pytest.fixture
-def revision_processor(mock_db, mock_embedder, mock_job_manager):
-    """Create revision processor with mocks."""
+def processor(mock_db, mock_embedder, job_manager):
     return RevisionProcessor(
         database=mock_db,
         embedder=mock_embedder,
-        job_manager=mock_job_manager,
+        job_manager=job_manager,
         embedding_model="embeddinggemma:300m-qat-q4_0",
+        chunker=Chunker(min_chunk_size=10, target_chunk_size=100, max_chunk_size=200, overlap_size=0),
     )
 
 
-def test_get_pipeline_key_html(revision_processor):
-    """Test pipeline key detection for HTML."""
-    assert revision_processor._get_pipeline_key("text/html") == PIPELINE_HTML
-    assert revision_processor._get_pipeline_key("text/html; charset=utf-8") == PIPELINE_HTML
+def test_pipeline_key_mapping_and_doc_rejection(processor):
+    assert processor._get_pipeline_key("text/html") == PIPELINE_HTML
+    assert processor._get_pipeline_key("application/xhtml+xml") == PIPELINE_HTML
+    assert processor._get_pipeline_key("application/pdf") == PIPELINE_PDF
+    assert processor._get_pipeline_key(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ) == PIPELINE_DOCX
+
+    with pytest.raises(UnsupportedContentTypeError, match="Legacy .doc"):
+        processor._get_pipeline_key("application/msword")
+    with pytest.raises(UnsupportedContentTypeError):
+        processor._get_pipeline_key("application/octet-stream")
 
 
-def test_get_pipeline_key_pdf(revision_processor):
-    """Test pipeline key detection for PDF."""
-    assert revision_processor._get_pipeline_key("application/pdf") == PIPELINE_PDF
+def test_empty_text_rejected_before_db_writes(processor, mock_db):
+    with pytest.raises(EmptyContentError):
+        processor.process_document(
+            job_id=1,
+            job_claim_token=uuid.uuid4(),
+            canonical_url="https://utc.edu.vn/empty",
+            title="Empty",
+            extracted_text="   ",
+            content_type="text/html",
+            source_id=1,
+        )
+    mock_db.transaction.assert_not_called()
 
 
-def test_get_pipeline_key_docx(revision_processor):
-    """Test pipeline key detection for DOCX."""
-    assert revision_processor._get_pipeline_key("application/vnd.openxmlformats-officedocument.wordprocessingml.document") == PIPELINE_DOCX
+def test_new_document_full_lifecycle(processor, mock_db, mock_embedder):
+    mock_cursor = MagicMock()
+    _setup_tx(mock_db, mock_cursor)
 
+    token = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(minutes=10)
+    captured_rev_token = {}
 
-def test_get_or_create_document_existing(revision_processor, mock_db):
-    """Test finding existing document."""
-    mock_db.execute_one.return_value = {"id": 123}
-    
-    doc_id = revision_processor._get_or_create_document("https://example.com", 1)
-    
-    assert doc_id == 123
-    mock_db.execute_one.assert_called_once()
+    def fake_execute(sql, params=None):
+        if "INSERT INTO document_revisions" in sql and params and "token" in params:
+            captured_rev_token["tok"] = params["token"]
 
+    mock_cursor.execute.side_effect = fake_execute
 
-def test_get_or_create_document_new(revision_processor, mock_db):
-    """Test creating new document."""
-    mock_db.execute_one.side_effect = [
-        None,  # Document not found
-        {"id": 456},  # Document created
-    ]
-    
-    doc_id = revision_processor._get_or_create_document("https://example.com", 1)
-    
-    assert doc_id == 456
-    assert mock_db.execute_one.call_count == 2
+    # Fetchone sequence across the 2 transactions:
+    # Tx 1 (_acquire_revision):
+    #   1. lock_owned_job -> valid job
+    #   2. INSERT knowledge_documents RETURNING id -> doc 10
+    #   3. INSERT document_revisions RETURNING id -> rev 50
+    # Tx 2 (_persist_chunks_and_complete):
+    #   4. lock_owned_job -> valid job
+    #   5. SELECT document_revisions FOR UPDATE -> rev 50 with matching token
+    #   6. integrity SELECT -> 1 valid chunk
+    #   7. UPDATE document_revisions SET status='PENDING' RETURNING id -> rev 50
+    def fetchone_gen():
+        yield {"id": 1, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now}
+        yield {"id": 10}
+        yield {"id": 50}
+        yield {"id": 1, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now}
+        yield {"crawl_job_id": 1, "indexing_claim_token": captured_rev_token["tok"], "expected_chunk_count": 1, "status": "INDEXING"}
+        yield {"total": 1, "unique_positions": 1, "min_pos": 0, "max_pos": 0, "invalid_rows": 0}
+        yield {"id": 50, "document_id": 10}
 
+    gen = fetchone_gen()
+    mock_cursor.fetchone.side_effect = lambda: next(gen)
 
-def test_find_existing_revision_found(revision_processor, mock_db):
-    """Test finding existing revision with same content."""
-    mock_db.execute_one.return_value = {"id": 789, "status": "PUBLISHED"}
-    
-    result = revision_processor._find_existing_revision(
-        document_id=123,
-        content_hash="abc123",
-        pipeline_key="html-v1",
-        embedding_model="test-model",
-    )
-    
-    assert result is not None
-    assert result["id"] == 789
-
-
-def test_find_existing_revision_not_found(revision_processor, mock_db):
-    """Test when no existing revision found."""
-    mock_db.execute_one.return_value = None
-    
-    result = revision_processor._find_existing_revision(
-        document_id=123,
-        content_hash="abc123",
-        pipeline_key="html-v1",
-        embedding_model="test-model",
-    )
-    
-    assert result is None
-
-
-@patch("src.revision_processor.compute_content_hash")
-def test_process_document_unchanged_content(
-    mock_hash, revision_processor, mock_db, mock_embedder
-):
-    """Test skipping embedding for unchanged content."""
-    mock_hash.return_value = "hash123"
-    mock_db.execute_one.side_effect = [
-        {"id": 10},  # get_or_create_document
-        {"id": 20, "status": "PUBLISHED"},  # find_existing_revision
-    ]
-    
-    result = revision_processor.process_document(
+    res = processor.process_document(
         job_id=1,
-        job_claim_token=uuid.uuid4(),
-        canonical_url="https://example.com",
-        title="Test",
-        extracted_text="content",
+        job_claim_token=token,
+        canonical_url="https://utc.edu.vn/page",
+        title="UTC Page",
+        extracted_text="This is valid admissions content for UTC.",
         content_type="text/html",
-        source_id=5,
+        source_id=1,
     )
-    
-    assert result["content_changed"] is False
-    assert result["chunks_created"] == 0
-    assert result["revision_id"] == 20
-    mock_embedder.embed.assert_not_called()
+
+    assert res["document_id"] == 10
+    assert res["revision_id"] == 50
+    assert res["chunks_created"] == 1
+    assert res["content_changed"] is True
+    assert res["document_created"] is True
+    mock_embedder.embed_batch.assert_called_once()
 
 
-@patch("src.revision_processor.compute_content_hash")
-def test_process_document_new_content(
-    mock_hash, revision_processor, mock_db, mock_embedder, mock_job_manager
-):
-    """Test processing new content creates revision and chunks."""
-    mock_hash.return_value = "newhash"
-    
-    # Mock chunker
-    mock_chunker = Mock()
-    mock_chunker.chunk_text.return_value = [
-        {"text": "chunk1", "position": 0, "body": "chunk1", "char_count": 6},
-        {"text": "chunk2", "position": 1, "body": "chunk2", "char_count": 6},
-    ]
-    revision_processor.chunker = mock_chunker
-    
-    # Setup mocks for document creation
-    mock_db.execute_one.side_effect = [
-        {"id": 10},  # get_or_create_document
-        None,  # find_existing_revision (not found)
-        {"id": 30},  # set_expected_chunk_count RETURNING id
-    ]
-    
-    # Mock the internal methods to avoid complex transaction mocking
-    job_token = uuid.uuid4()
-    rev_token = uuid.uuid4()
-    
-    with patch.object(revision_processor, '_create_revision', return_value=(30, rev_token)), \
-         patch.object(revision_processor, '_embed_and_insert_chunks'), \
-         patch.object(revision_processor, '_complete_indexing'):
-        
-        result = revision_processor.process_document(
-            job_id=1,
-            job_claim_token=job_token,
-            canonical_url="https://example.com",
-            title="Test",
-            extracted_text="new content",
-            content_type="text/html",
-            source_id=5,
-        )
-        
-        assert result["content_changed"] is True
-        assert result["chunks_created"] == 2
-        
-        # Verify the methods were called correctly
-        revision_processor._create_revision.assert_called_once()
-        revision_processor._embed_and_insert_chunks.assert_called_once()
-        revision_processor._complete_indexing.assert_called_once()
-
-
-def test_create_revision_job_verification(revision_processor, mock_db, mock_job_manager):
-    """Test revision creation verifies job ownership."""
-    job_token = uuid.uuid4()
-    mock_job_manager.verify_ownership.side_effect = ClaimTokenMismatchError("Invalid token")
-    
+@pytest.mark.parametrize("existing_status", ["PENDING", "PUBLISHED", "ARCHIVED", "REVOKED"])
+def test_existing_revision_statuses_skip_embedding(processor, mock_db, mock_embedder, existing_status):
     mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-    
-    with pytest.raises(ClaimTokenMismatchError):
-        revision_processor._create_revision(
-            job_id=1,
-            job_claim_token=job_token,
-            document_id=10,
-            canonical_url="https://example.com",
-            title="Test",
-            content_hash="hash",
-            pipeline_key="html-v1",
-        )
-
-
-def test_set_expected_chunk_count_success(revision_processor, mock_db):
-    """Test setting expected chunk count."""
+    _setup_tx(mock_db, mock_cursor)
     token = uuid.uuid4()
-    mock_db.execute_one.return_value = {"id": 30}
-    
-    revision_processor._set_expected_chunk_count(
-        revision_id=30,
-        indexing_claim_token=token,
-        expected_count=5,
-    )
-    
-    mock_db.execute_one.assert_called_once()
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(minutes=10)
 
-
-def test_set_expected_chunk_count_token_mismatch(revision_processor, mock_db):
-    """Test setting chunk count with invalid token."""
-    token = uuid.uuid4()
-    mock_db.execute_one.return_value = None  # UPDATE failed
-    
-    with pytest.raises(ClaimTokenMismatchError):
-        revision_processor._set_expected_chunk_count(
-            revision_id=30,
-            indexing_claim_token=token,
-            expected_count=5,
-        )
-
-
-def test_embed_and_insert_chunks_job_token_mismatch(
-    revision_processor, mock_db, mock_embedder
-):
-    """Test chunk insertion rejects invalid job token."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-    
-    job_token = uuid.uuid4()
-    different_token = uuid.uuid4()
-    
-    mock_cursor.fetchone.return_value = {
-        "claim_token": different_token,
-        "status": "RUNNING",
-        "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10),
-    }
-    
-    chunks = [{"body": "test", "position": 0}]
-    
-    with pytest.raises(ClaimTokenMismatchError, match="job reclaimed"):
-        revision_processor._embed_and_insert_chunks(
-            job_id=1,
-            job_claim_token=job_token,
-            revision_id=30,
-            indexing_claim_token=uuid.uuid4(),
-            chunks=chunks,
-        )
-
-
-def test_embed_and_insert_chunks_lease_expired(
-    revision_processor, mock_db, mock_embedder
-):
-    """Test chunk insertion rejects expired lease."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-    
-    job_token = uuid.uuid4()
-    expired_time = datetime.now(timezone.utc) - timedelta(minutes=5)
-    
     mock_cursor.fetchone.side_effect = [
-        {"claim_token": job_token, "status": "RUNNING", "lease_until": expired_time},
-        {"now": datetime.now(timezone.utc)},
+        {"id": 1, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now},
+        None,        # INSERT doc ON CONFLICT DO NOTHING -> already exists
+        {"id": 10},  # SELECT doc id
+        None,        # INSERT rev ON CONFLICT DO NOTHING -> conflict
+        {
+            "id": 99,
+            "status": existing_status,
+            "crawl_job_id": 1,
+            "indexing_claim_token": None,
+            "owner_job_status": "COMPLETED",
+            "owner_lease_until": None,
+            "db_now": now,
+        },
     ]
-    
-    chunks = [{"body": "test", "position": 0}]
-    
-    with pytest.raises(LeaseExpiredError):
-        revision_processor._embed_and_insert_chunks(
-            job_id=1,
-            job_claim_token=job_token,
-            revision_id=30,
-            indexing_claim_token=uuid.uuid4(),
-            chunks=chunks,
-        )
 
-
-def test_embed_and_insert_chunks_revision_token_mismatch(
-    revision_processor, mock_db, mock_embedder
-):
-    """Test chunk insertion rejects invalid revision token."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-    
-    job_token = uuid.uuid4()
-    rev_token = uuid.uuid4()
-    different_rev_token = uuid.uuid4()
-    
-    mock_cursor.fetchone.side_effect = [
-        {"claim_token": job_token, "status": "RUNNING", "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10)},
-        {"now": datetime.now(timezone.utc)},
-        {"crawl_job_id": 1, "indexing_claim_token": different_rev_token, "status": "INDEXING"},
-    ]
-    
-    chunks = [{"body": "test", "position": 0}]
-    
-    with pytest.raises(ClaimTokenMismatchError, match="revision reclaimed"):
-        revision_processor._embed_and_insert_chunks(
-            job_id=1,
-            job_claim_token=job_token,
-            revision_id=30,
-            indexing_claim_token=rev_token,
-            chunks=chunks,
-        )
-
-
-def test_complete_indexing_count_mismatch(revision_processor, mock_db):
-    """Test integrity verification fails with wrong count."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-    
-    job_token = uuid.uuid4()
-    rev_token = uuid.uuid4()
-    
-    mock_cursor.fetchone.side_effect = [
-        {"claim_token": job_token, "status": "RUNNING", "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10)},
-        {"indexing_claim_token": rev_token, "expected_chunk_count": 5, "status": "INDEXING"},
-        {"total": 3, "unique_positions": 3, "min_pos": 0, "max_pos": 2},  # Wrong count
-    ]
-    
-    with pytest.raises(ChunkCountMismatchError, match="expected 5 chunks, got 3"):
-        revision_processor._complete_indexing(
-            job_id=1,
-            job_claim_token=job_token,
-            revision_id=30,
-            indexing_claim_token=rev_token,
-            expected_count=5,
-        )
-
-
-def test_complete_indexing_duplicate_positions(revision_processor, mock_db):
-    """Test integrity verification fails with duplicate positions."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-    
-    job_token = uuid.uuid4()
-    rev_token = uuid.uuid4()
-    
-    mock_cursor.fetchone.side_effect = [
-        {"claim_token": job_token, "status": "RUNNING", "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10)},
-        {"indexing_claim_token": rev_token, "expected_chunk_count": 5, "status": "INDEXING"},
-        {"total": 5, "unique_positions": 4, "min_pos": 0, "max_pos": 4},  # Duplicate
-    ]
-    
-    with pytest.raises(ChunkCountMismatchError, match="duplicate positions"):
-        revision_processor._complete_indexing(
-            job_id=1,
-            job_claim_token=job_token,
-            revision_id=30,
-            indexing_claim_token=rev_token,
-            expected_count=5,
-        )
-
-
-def test_complete_indexing_wrong_min_position(revision_processor, mock_db):
-    """Test integrity verification fails with wrong min position."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-    
-    job_token = uuid.uuid4()
-    rev_token = uuid.uuid4()
-    
-    mock_cursor.fetchone.side_effect = [
-        {"claim_token": job_token, "status": "RUNNING", "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10)},
-        {"indexing_claim_token": rev_token, "expected_chunk_count": 5, "status": "INDEXING"},
-        {"total": 5, "unique_positions": 5, "min_pos": 1, "max_pos": 5},  # Wrong min
-    ]
-    
-    with pytest.raises(ChunkCountMismatchError, match="min position is 1, expected 0"):
-        revision_processor._complete_indexing(
-            job_id=1,
-            job_claim_token=job_token,
-            revision_id=30,
-            indexing_claim_token=rev_token,
-            expected_count=5,
-        )
-
-
-def test_complete_indexing_wrong_max_position(revision_processor, mock_db):
-    """Test integrity verification fails with wrong max position."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-    
-    job_token = uuid.uuid4()
-    rev_token = uuid.uuid4()
-    
-    mock_cursor.fetchone.side_effect = [
-        {"claim_token": job_token, "status": "RUNNING", "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10)},
-        {"indexing_claim_token": rev_token, "expected_chunk_count": 5, "status": "INDEXING"},
-        {"total": 5, "unique_positions": 5, "min_pos": 0, "max_pos": 5},  # Wrong max
-    ]
-    
-    with pytest.raises(ChunkCountMismatchError, match="max position is 5, expected 4"):
-        revision_processor._complete_indexing(
-            job_id=1,
-            job_claim_token=job_token,
-            revision_id=30,
-            indexing_claim_token=rev_token,
-            expected_count=5,
-        )
-
-
-def test_complete_indexing_gaps_in_positions(revision_processor, mock_db):
-    """Test integrity verification fails with gaps."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-    
-    job_token = uuid.uuid4()
-    rev_token = uuid.uuid4()
-    
-    mock_cursor.fetchone.side_effect = [
-        {"claim_token": job_token, "status": "RUNNING", "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10)},
-        {"indexing_claim_token": rev_token, "expected_chunk_count": 5, "status": "INDEXING"},
-        {"total": 4, "unique_positions": 4, "min_pos": 0, "max_pos": 4},  # Gap (missing position 2)
-    ]
-    
-    with pytest.raises(ChunkCountMismatchError, match="expected 5 chunks, got 4"):
-        revision_processor._complete_indexing(
-            job_id=1,
-            job_claim_token=job_token,
-            revision_id=30,
-            indexing_claim_token=rev_token,
-            expected_count=5,
-        )
-
-
-def test_complete_indexing_success(revision_processor, mock_db):
-    """Test successful integrity verification and transition to PENDING."""
-    mock_cursor = MagicMock()
-    setup_mock_transaction(mock_db, mock_cursor)
-    
-    job_token = uuid.uuid4()
-    rev_token = uuid.uuid4()
-    
-    mock_cursor.fetchone.side_effect = [
-        {"claim_token": job_token, "status": "RUNNING", "lease_until": datetime.now(timezone.utc) + timedelta(minutes=10)},
-        {"indexing_claim_token": rev_token, "expected_chunk_count": 3, "status": "INDEXING"},
-        {"total": 3, "unique_positions": 3, "min_pos": 0, "max_pos": 2},  # Valid
-        {"id": 30},  # UPDATE successful
-    ]
-    
-    # Should not raise
-    revision_processor._complete_indexing(
+    res = processor.process_document(
         job_id=1,
-        job_claim_token=job_token,
-        revision_id=30,
-        indexing_claim_token=rev_token,
-        expected_count=3,
+        job_claim_token=token,
+        canonical_url="https://utc.edu.vn/page",
+        title="UTC Page",
+        extracted_text="Same content as before.",
+        content_type="text/html",
+        source_id=1,
     )
 
+    assert res["content_changed"] is False
+    assert res["revision_id"] == 99
+    assert res["skipped_reason"] == existing_status.lower()
+    mock_embedder.embed_batch.assert_not_called()
 
-def test_cleanup_failed_revision(revision_processor, mock_db):
-    """Test cleanup deletes chunks and revision when ownership valid."""
-    # Setup mock transaction with cursor
-    mock_conn = MagicMock()
+
+def test_abandoned_indexing_revision_is_reclaimed(processor, mock_db, mock_embedder):
     mock_cursor = MagicMock()
-    mock_conn.__enter__.return_value = mock_conn
-    mock_conn.__exit__.return_value = False
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_conn.cursor.return_value.__exit__.return_value = False
-    mock_db.transaction.return_value.__enter__.return_value = mock_conn
-    mock_db.transaction.return_value.__exit__.return_value = False
-    
+    _setup_tx(mock_db, mock_cursor)
     token = uuid.uuid4()
-    mock_cursor.fetchone.return_value = {
-        "id": 30,
-        "indexing_claim_token": token,
-        "status": "INDEXING",
-    }
-    
-    revision_processor._cleanup_failed_revision(30, token)
-    
-    # Should have 3 queries: SELECT FOR UPDATE, DELETE chunks, DELETE revision
-    assert mock_cursor.execute.call_count == 3
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(minutes=10)
+    captured = {}
+
+    def fake_execute(sql, params=None):
+        if "UPDATE document_revisions" in sql and "SET crawl_job_id" in sql:
+            captured["tok"] = params["token"]
+
+    mock_cursor.execute.side_effect = fake_execute
+
+    def gen():
+        yield {"id": 2, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now}
+        yield None
+        yield {"id": 10}
+        yield None  # conflict on INSERT
+        yield {
+            "id": 77,
+            "status": "INDEXING",
+            "crawl_job_id": 1,
+            "indexing_claim_token": uuid.uuid4(),
+            "owner_job_status": "FAILED",  # previous owner died!
+            "owner_lease_until": now - timedelta(minutes=30),
+            "db_now": now,
+        }
+        yield {"id": 77}  # UPDATE reclaim RETURNING id
+        # Phase 2: persist & complete
+        yield {"id": 2, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now}
+        yield {"crawl_job_id": 2, "indexing_claim_token": captured["tok"], "expected_chunk_count": 1, "status": "INDEXING"}
+        yield {"total": 1, "unique_positions": 1, "min_pos": 0, "max_pos": 0, "invalid_rows": 0}
+        yield {"id": 77, "document_id": 10}
+
+    it = gen()
+    mock_cursor.fetchone.side_effect = lambda: next(it)
+
+    res = processor.process_document(
+        job_id=2,
+        job_claim_token=token,
+        canonical_url="https://utc.edu.vn/stuck",
+        title="Recovered",
+        extracted_text="Recovered text after previous worker crashed.",
+        content_type="text/html",
+        source_id=1,
+    )
+    assert res["revision_id"] == 77
+    assert res["content_changed"] is True
 
 
-def test_embedding_failure_triggers_cleanup(
-    revision_processor, mock_db, mock_embedder, mock_job_manager
-):
-    """Test that embedding failure triggers cleanup."""
-    mock_embedder.embed.side_effect = Exception("Ollama unavailable")
-    
-    # Setup mocks
-    mock_db.execute_one.side_effect = [
-        {"id": 10},  # get_or_create_document
-        None,  # find_existing_revision
-        {"id": 30},  # set_expected_chunk_count RETURNING id
-    ]
-    
-    # Setup transaction mock for cleanup
-    mock_conn = MagicMock()
+def test_lease_expired_during_completion_fails_and_cleans_up(processor, mock_db):
     mock_cursor = MagicMock()
-    mock_conn.__enter__.return_value = mock_conn
-    mock_conn.__exit__.return_value = False
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_conn.cursor.return_value.__exit__.return_value = False
-    mock_db.transaction.return_value.__enter__.return_value = mock_conn
-    mock_db.transaction.return_value.__exit__.return_value = False
-    
-    job_token = uuid.uuid4()
-    rev_token = uuid.uuid4()
-    
-    # Mock cleanup will find ownership valid
-    mock_cursor.fetchone.return_value = {
-        "id": 30,
-        "indexing_claim_token": rev_token,
-        "status": "INDEXING",
-    }
-    
-    # Mock chunker
-    mock_chunker = Mock()
-    mock_chunker.chunk_text.return_value = [{"text": "chunk1", "position": 0, "body": "chunk1", "char_count": 6}]
-    revision_processor.chunker = mock_chunker
-    
-    with pytest.raises(DatabaseError, match="Failed to generate embedding"):
-        revision_processor.process_document(
+    _setup_tx(mock_db, mock_cursor)
+    token = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(minutes=10)
+    captured = {}
+
+    def fake_execute(sql, params=None):
+        if "INSERT INTO document_revisions" in sql and params and "token" in params:
+            captured["tok"] = params["token"]
+
+    mock_cursor.execute.side_effect = fake_execute
+
+    def gen():
+        # Acquire succeeds
+        yield {"id": 1, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now}
+        yield {"id": 10}
+        yield {"id": 50}
+        # Persist sees expired lease!
+        yield {"id": 1, "status": "RUNNING", "claim_token": token, "lease_until": now - timedelta(seconds=5), "attempt_no": 1, "db_now": now}
+        # Cleanup checks revision ownership
+        yield {"id": 50, "indexing_claim_token": captured["tok"], "status": "INDEXING"}
+
+    it = gen()
+    mock_cursor.fetchone.side_effect = lambda: next(it)
+
+    with pytest.raises(LeaseExpiredError):
+        processor.process_document(
             job_id=1,
-            job_claim_token=job_token,
-            canonical_url="https://example.com",
-            title="Test",
-            extracted_text="content",
+            job_claim_token=token,
+            canonical_url="https://utc.edu.vn/slow",
+            title="Slow",
+            extracted_text="Some text whose embedding outlived the lease.",
             content_type="text/html",
-            source_id=5,
+            source_id=1,
         )
-    
-    # Cleanup should have been attempted (3 execute calls: SELECT FOR UPDATE, DELETE chunks, DELETE revision)
-    assert mock_cursor.execute.call_count >= 1
+
+
+def test_chunk_integrity_failure_raises_chunk_count_mismatch(processor, mock_db):
+    mock_cursor = MagicMock()
+    _setup_tx(mock_db, mock_cursor)
+    token = uuid.uuid4()
+    rev_token = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(minutes=10)
+
+    mock_cursor.fetchone.side_effect = [
+        {"id": 1, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now},
+        {"crawl_job_id": 1, "indexing_claim_token": rev_token, "expected_chunk_count": 2, "status": "INDEXING"},
+        {"total": 1, "unique_positions": 1, "min_pos": 0, "max_pos": 0, "invalid_rows": 0},  # mismatch!
+    ]
+
+    with pytest.raises(ChunkCountMismatchError):
+        processor._persist_chunks_and_complete(
+            job_id=1,
+            job_claim_token=token,
+            revision_id=50,
+            indexing_claim_token=rev_token,
+            embedded_chunks=[{"revision_id": 50, "position": 0, "body": "a", "embedding": [0.1] * 768}],
+            expected_count=2,
+        )
+
+
+def test_archive_document_revisions_and_missing_source_documents(processor, mock_db):
+    mock_cursor = MagicMock()
+    _setup_tx(mock_db, mock_cursor)
+    token = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(minutes=10)
+
+    # 1. archive_document_revisions archives PENDING/PUBLISHED revisions
+    mock_cursor.fetchone.side_effect = [
+        {"id": 1, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now},
+        {"id": 10},
+    ]
+    mock_cursor.fetchall.return_value = [{"id": 50}, {"id": 51}]
+    archived = processor.archive_document_revisions(1, token, "https://utc.edu.vn/removed", reason="HTTP 404")
+    assert archived == 2
+
+    # 2. archive_missing_source_documents archives disappeared URLs
+    mock_cursor.fetchone.side_effect = [
+        {"id": 1, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now},
+    ]
+    mock_cursor.fetchall.return_value = [{"id": 60}]
+    archived_missing = processor.archive_missing_source_documents(1, token, source_id=5, active_canonical_urls=["https://utc.edu.vn/keep"])
+    assert archived_missing == 1
+
+
+def test_auto_publish_archives_old_published_before_publishing_new(mock_db, mock_embedder, job_manager):
+    proc = RevisionProcessor(
+        database=mock_db,
+        embedder=mock_embedder,
+        job_manager=job_manager,
+        embedding_model="embeddinggemma:300m-qat-q4_0",
+        auto_publish=True,
+    )
+    mock_cursor = MagicMock()
+    _setup_tx(mock_db, mock_cursor)
+    token = uuid.uuid4()
+    rev_token = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(minutes=10)
+
+    mock_cursor.fetchone.side_effect = [
+        {"id": 1, "status": "RUNNING", "claim_token": token, "lease_until": future, "attempt_no": 1, "db_now": now},
+        {"document_id": 10, "crawl_job_id": 1, "indexing_claim_token": rev_token, "expected_chunk_count": 1, "status": "INDEXING"},
+        {"total": 1, "unique_positions": 1, "min_pos": 0, "max_pos": 0, "invalid_rows": 0},
+        {"id": 50, "document_id": 10},
+    ]
+
+    proc._persist_chunks_and_complete(
+        job_id=1,
+        job_claim_token=token,
+        revision_id=50,
+        indexing_claim_token=rev_token,
+        embedded_chunks=[{"revision_id": 50, "position": 0, "body": "text", "embedding": [0.1] * 768}],
+        expected_count=1,
+    )
+
+    sqls = [c[0][0] for c in mock_cursor.execute.call_args_list]
+    archive_idx = next(i for i, s in enumerate(sqls) if "SET status = 'ARCHIVED'" in s)
+    publish_idx = next(i for i, s in enumerate(sqls) if "SET status = 'PUBLISHED'" in s)
+    assert archive_idx < publish_idx
+    assert "source_verified = true" in sqls[publish_idx]
+    assert "published_at = clock_timestamp()" in sqls[publish_idx]

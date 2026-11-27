@@ -1,434 +1,433 @@
-"""Job management with lease-based claiming.
+"""Job management with lease-based claiming and token fencing.
 
-Implements AD-002: Lease-based job claiming with token fencing.
+Ownership model
+---------------
+A worker owns a job iff, at the moment a statement executes inside PostgreSQL:
+
+    status = 'RUNNING' AND claim_token = <token> AND lease_until > clock_timestamp()
+
+Every state transition (heartbeat, complete, fail, release) re-checks that
+predicate *inside the same UPDATE / transaction*, using the database clock, so a
+stale worker (lease expired, job reclaimed, token rotated) can never overwrite
+the job state. Failure diagnostics distinguish token mismatch, lease expiry and
+wrong status.
+
+``attempt_no`` counts how many times the job has been claimed (execution
+attempts). It is incremented by ``claim_job`` and decremented only by
+``release_job`` (graceful shutdown, the attempt is not counted).
 """
 
 import logging
+import random
+import re
 import uuid
-from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 from .database import Database
-from .exceptions import LeaseExpiredError, ClaimTokenMismatchError, DatabaseError
+from .exceptions import (
+    ClaimTokenMismatchError,
+    DatabaseError,
+    JobStateError,
+    LeaseExpiredError,
+)
 
 logger = logging.getLogger(__name__)
+
+MAX_ERROR_MESSAGE_LENGTH = 2000
+
+_SECRET_PATTERNS = [
+    # key=value / key: value secrets
+    (re.compile(r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|authorization)\b\s*[=:]\s*\S+"),
+     r"\1=***"),
+    # credentials in URLs: scheme://user:pass@host
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@"), r"\1***:***@"),
+    # Bearer tokens
+    (re.compile(r"(?i)\bbearer\s+[a-z0-9._\-]+"), "Bearer ***"),
+]
+
+
+def sanitize_error_message(message: Optional[str], limit: int = MAX_ERROR_MESSAGE_LENGTH) -> str:
+    """Remove obvious secrets and bound the length of an error message."""
+    text = (message or "").strip() or "Unknown error"
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    text = text.replace("\x00", "")
+    if len(text) > limit:
+        text = text[: limit - 15] + "... [truncated]"
+    return text
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Exponential backoff with cap and jitter.
+
+    delay(attempt) = min(base * 2^(attempt-1), max) * (1 ± jitter)
+
+    With the defaults (max_attempts=3, base=15 min, max=6 h, jitter 20%):
+    attempt 1 fails -> retry after ~15 min, attempt 2 fails -> ~30 min,
+    attempt 3 fails -> FAILED (no more retries).
+    """
+
+    max_attempts: int = 3
+    base_delay_seconds: int = 900
+    max_delay_seconds: int = 21600
+    jitter_ratio: float = 0.2
+
+    def __post_init__(self):
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if self.base_delay_seconds < 0 or self.max_delay_seconds < self.base_delay_seconds:
+            raise ValueError("invalid retry delays")
+        if not 0 <= self.jitter_ratio <= 1:
+            raise ValueError("jitter_ratio must be within [0, 1]")
+
+    def should_retry(self, attempt_no: int, retryable: bool = True) -> bool:
+        return retryable and attempt_no < self.max_attempts
+
+    def delay_seconds(self, attempt_no: int, rng: Optional[random.Random] = None) -> float:
+        attempt = max(1, attempt_no)
+        raw = min(self.base_delay_seconds * (2 ** (attempt - 1)), self.max_delay_seconds)
+        if self.jitter_ratio and raw > 0:
+            r = (rng or random).uniform(-self.jitter_ratio, self.jitter_ratio)
+            raw = raw * (1 + r)
+        return max(0.0, min(raw, self.max_delay_seconds * (1 + self.jitter_ratio)))
 
 
 class JobManager:
     """Manages crawler job lifecycle with lease-based ownership."""
 
-    def __init__(self, database: Database, lease_duration_minutes: int = 10):
-        """Initialize job manager.
-
-        Args:
-            database: Database connection manager
-            lease_duration_minutes: Lease duration in minutes (default 10)
-        """
+    def __init__(
+        self,
+        database: Database,
+        lease_duration_seconds: int = 600,
+        retry_policy: Optional[RetryPolicy] = None,
+    ):
+        if lease_duration_seconds <= 0:
+            raise ValueError("lease_duration_seconds must be > 0")
         self.db = database
-        self.lease_duration_minutes = lease_duration_minutes
-        self.current_job_id: Optional[int] = None
-        self.current_claim_token: Optional[uuid.UUID] = None
+        self.lease_duration_seconds = int(lease_duration_seconds)
+        self.retry_policy = retry_policy or RetryPolicy()
 
+    # ------------------------------------------------------------------ helpers
+    @property
+    def _lease_interval(self) -> str:
+        return f"{self.lease_duration_seconds} seconds"
+
+    @staticmethod
+    def _diagnose(cur, job_id: int, claim_token: uuid.UUID, action: str) -> None:
+        """Raise the precise ownership error for a job (called after a fenced UPDATE matched 0 rows)."""
+        cur.execute(
+            """
+            SELECT status, claim_token, lease_until, clock_timestamp() AS db_now
+            FROM crawl_jobs WHERE id = %(job_id)s
+            """,
+            {"job_id": job_id},
+        )
+        state = cur.fetchone()
+        if not state:
+            raise DatabaseError(f"Cannot {action} job {job_id}: job not found")
+        if state["claim_token"] != claim_token:
+            raise ClaimTokenMismatchError(
+                f"Cannot {action} job {job_id}: claim token mismatch (job reclaimed or finished)"
+            )
+        if state["status"] != "RUNNING":
+            raise JobStateError(f"Cannot {action} job {job_id}: status is {state['status']}")
+        if state["lease_until"] is None or state["lease_until"] <= state["db_now"]:
+            raise LeaseExpiredError(
+                f"Cannot {action} job {job_id}: lease expired at {state['lease_until']} "
+                f"(database time {state['db_now']})"
+            )
+        raise DatabaseError(f"Cannot {action} job {job_id}: unexpected state {dict(state)}")
+
+    def lock_owned_job(self, cur, job_id: int, claim_token: uuid.UUID) -> Dict[str, Any]:
+        """Lock the job row FOR UPDATE inside the caller's transaction and verify ownership.
+
+        The lock is held until the caller's transaction ends, so writes performed in
+        the same transaction are fenced: reclaim/complete by others must wait, and
+        will observe our committed state.
+        """
+        cur.execute(
+            """
+            SELECT id, status, claim_token, lease_until, attempt_no,
+                   clock_timestamp() AS db_now
+            FROM crawl_jobs
+            WHERE id = %(job_id)s
+            FOR UPDATE
+            """,
+            {"job_id": job_id},
+        )
+        state = cur.fetchone()
+        if not state:
+            raise DatabaseError(f"Job {job_id} not found")
+        if state["claim_token"] != claim_token:
+            raise ClaimTokenMismatchError(f"Job {job_id} claim token mismatch (job reclaimed)")
+        if state["status"] != "RUNNING":
+            raise JobStateError(f"Job {job_id} status is {state['status']}, expected RUNNING")
+        if state["lease_until"] is None or state["lease_until"] <= state["db_now"]:
+            raise LeaseExpiredError(
+                f"Job {job_id} lease expired at {state['lease_until']} (database time {state['db_now']})"
+            )
+        return state
+
+    # --------------------------------------------------------------- lifecycle
     def claim_job(self) -> Optional[Dict[str, Any]]:
-        """Atomically claim a pending job using SELECT FOR UPDATE SKIP LOCKED.
+        """Atomically claim the next runnable PENDING job (FOR UPDATE SKIP LOCKED)."""
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE crawl_jobs
+                    SET status = 'RUNNING',
+                        lease_until = clock_timestamp() + %(lease)s::interval,
+                        claim_token = gen_random_uuid(),
+                        attempt_no = attempt_no + 1,
+                        completed_at = NULL
+                    WHERE id = (
+                        SELECT id FROM crawl_jobs
+                        WHERE status = 'PENDING'
+                          AND run_after <= clock_timestamp()
+                        ORDER BY run_after, id
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING id, source_id, status, claim_token, lease_until, attempt_no
+                    """,
+                    {"lease": self._lease_interval},
+                )
+                job = cur.fetchone()
 
-        Implements AD-002 lease-based claiming with token generation.
+        if job:
+            logger.info(
+                "Claimed job %s for source %s (attempt %s/%s, lease until %s)",
+                job["id"], job["source_id"], job["attempt_no"],
+                self.retry_policy.max_attempts, job["lease_until"],
+            )
+        return job
+
+    def heartbeat(self, job_id: int, claim_token: uuid.UUID) -> Any:
+        """Extend the lease. Never extends a lease that already expired or was lost.
 
         Returns:
-            Job record dict with id, source_id, claim_token, etc., or None if no jobs available
-
+            New lease_until.
         Raises:
-            DatabaseError: If claiming fails
+            ClaimTokenMismatchError / LeaseExpiredError / JobStateError on lost ownership.
         """
-        try:
-            with self.db.transaction() as conn:
-                with conn.cursor() as cur:
-                    # Atomically claim next pending job
-                    # Uses FOR UPDATE SKIP LOCKED per AD-002
-                    cur.execute(
-                        """
-                        UPDATE crawl_jobs
-                        SET status = 'RUNNING',
-                            lease_until = clock_timestamp() + %(lease_interval)s::interval,
-                            claim_token = gen_random_uuid(),
-                            attempt_no = attempt_no + 1
-                        WHERE id = (
-                            SELECT id FROM crawl_jobs
-                            WHERE status = 'PENDING' 
-                              AND run_after <= clock_timestamp()
-                            ORDER BY run_after, id
-                            LIMIT 1
-                            FOR UPDATE SKIP LOCKED
-                        )
-                        RETURNING id, source_id, status, claim_token, lease_until, attempt_no
-                        """,
-                        {"lease_interval": f"{self.lease_duration_minutes} minutes"},
-                    )
-
-                    result = cur.fetchone()
-
-                    if result:
-                        self.current_job_id = result["id"]
-                        self.current_claim_token = result["claim_token"]
-
-                        logger.info(
-                            f"Claimed job {result['id']} for source {result['source_id']} "
-                            f"(attempt {result['attempt_no']}, lease until {result['lease_until']})"
-                        )
-
-                        return result
-
-                    logger.debug("No pending jobs available to claim")
-                    return None
-
-        except Exception as e:
-            logger.error(f"Failed to claim job: {e}")
-            raise DatabaseError(f"Job claiming failed: {e}") from e
-
-    def heartbeat(self, job_id: int, claim_token: uuid.UUID) -> None:
-        """Extend job lease to keep ownership alive.
-
-        Implements AD-002 heartbeat mechanism with token verification.
-
-        Args:
-            job_id: Job ID
-            claim_token: Current claim token
-
-        Raises:
-            ClaimTokenMismatchError: If token doesn't match (job reclaimed)
-            LeaseExpiredError: If lease already expired
-            DatabaseError: If update fails
-        """
-        try:
-            with self.db.transaction() as conn:
-                with conn.cursor() as cur:
-                    # Extend lease only if token matches, still RUNNING, and lease not expired (HIGH-002 fix)
-                    cur.execute(
-                        """
-                        UPDATE crawl_jobs
-                        SET lease_until = clock_timestamp() + %(lease_interval)s::interval
-                        WHERE id = %(job_id)s
-                          AND claim_token = %(claim_token)s
-                          AND status = 'RUNNING'
-                          AND lease_until > clock_timestamp()
-                        RETURNING id, lease_until
-                        """,
-                        {
-                            "job_id": job_id,
-                            "claim_token": claim_token,
-                            "lease_interval": f"{self.lease_duration_minutes} minutes",
-                        },
-                    )
-
-                    result = cur.fetchone()
-
-                    if not result:
-                        # Check why update failed
-                        cur.execute(
-                            """
-                            SELECT status, claim_token, lease_until, clock_timestamp() as db_now
-                            FROM crawl_jobs WHERE id = %(job_id)s
-                            """,
-                            {"job_id": job_id},
-                        )
-                        job_state = cur.fetchone()
-
-                        if not job_state:
-                            raise DatabaseError(f"Job {job_id} not found")
-
-                        if job_state["claim_token"] != claim_token:
-                            raise ClaimTokenMismatchError(
-                                f"Job {job_id} claim token changed (job reclaimed by another worker)"
-                            )
-
-                        # Use database clock for lease check (consistent with HIGH-001 fix)
-                        if job_state["lease_until"] and job_state["lease_until"] < job_state["db_now"]:
-                            raise LeaseExpiredError(
-                                f"Job {job_id} lease expired at {job_state['lease_until']} (database time: {job_state['db_now']})"
-                            )
-
-                        raise DatabaseError(
-                            f"Job {job_id} heartbeat failed: status={job_state['status']}"
-                        )
-
-                    logger.debug(
-                        f"Heartbeat successful for job {job_id}, lease extended to {result['lease_until']}"
-                    )
-
-        except (ClaimTokenMismatchError, LeaseExpiredError):
-            raise
-        except Exception as e:
-            logger.error(f"Heartbeat failed for job {job_id}: {e}")
-            raise DatabaseError(f"Heartbeat failed: {e}") from e
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE crawl_jobs
+                    SET lease_until = clock_timestamp() + %(lease)s::interval
+                    WHERE id = %(job_id)s
+                      AND claim_token = %(token)s
+                      AND status = 'RUNNING'
+                      AND lease_until > clock_timestamp()
+                    RETURNING lease_until
+                    """,
+                    {"job_id": job_id, "token": claim_token, "lease": self._lease_interval},
+                )
+                row = cur.fetchone()
+                if not row:
+                    self._diagnose(cur, job_id, claim_token, "heartbeat")
+        logger.debug("Heartbeat ok for job %s, lease until %s", job_id, row["lease_until"])
+        return row["lease_until"]
 
     def complete_job(
-        self, job_id: int, claim_token: uuid.UUID, completed_at: Optional[datetime] = None
+        self, job_id: int, claim_token: uuid.UUID, summary: Optional[str] = None
     ) -> None:
-        """Mark job as successfully completed.
+        """Mark job COMPLETED (only with valid token AND unexpired lease).
 
         Args:
-            job_id: Job ID
-            claim_token: Current claim token
-            completed_at: Completion timestamp (defaults to now)
-
-        Raises:
-            ClaimTokenMismatchError: If token doesn't match
-            DatabaseError: If update fails
+            summary: Optional note stored in error_message (e.g. per-URL failures of a
+                partially successful crawl). NULL for a clean run.
         """
-        try:
-            with self.db.transaction() as conn:
-                with conn.cursor() as cur:
-                    # Transition to COMPLETED only if we still own it
-                    # Note: completed_at column added in migration 005
-                    cur.execute(
-                        """
-                        UPDATE crawl_jobs
-                        SET status = 'COMPLETED',
-                            lease_until = NULL,
-                            claim_token = NULL
-                        WHERE id = %(job_id)s
-                          AND claim_token = %(claim_token)s
-                          AND status = 'RUNNING'
-                        RETURNING id
-                        """,
-                        {
-                            "job_id": job_id,
-                            "claim_token": claim_token,
-                        },
-                    )
-
-                    result = cur.fetchone()
-
-                    if not result:
-                        # Check if token mismatch
-                        cur.execute(
-                            "SELECT claim_token FROM crawl_jobs WHERE id = %(job_id)s",
-                            {"job_id": job_id},
-                        )
-                        job_state = cur.fetchone()
-
-                        if job_state and job_state["claim_token"] != claim_token:
-                            raise ClaimTokenMismatchError(
-                                f"Cannot complete job {job_id}: claim token mismatch"
-                            )
-
-                        raise DatabaseError(
-                            f"Failed to complete job {job_id} (may have been reclaimed)"
-                        )
-
-                    logger.info(f"Job {job_id} completed successfully")
-
-                    # Clear current job tracking
-                    if self.current_job_id == job_id:
-                        self.current_job_id = None
-                        self.current_claim_token = None
-
-        except ClaimTokenMismatchError:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to complete job {job_id}: {e}")
-            raise DatabaseError(f"Job completion failed: {e}") from e
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE crawl_jobs
+                    SET status = 'COMPLETED',
+                        completed_at = clock_timestamp(),
+                        error_message = %(summary)s,
+                        lease_until = NULL,
+                        claim_token = NULL
+                    WHERE id = %(job_id)s
+                      AND claim_token = %(token)s
+                      AND status = 'RUNNING'
+                      AND lease_until > clock_timestamp()
+                    RETURNING id, completed_at
+                    """,
+                    {
+                        "job_id": job_id,
+                        "token": claim_token,
+                        "summary": sanitize_error_message(summary) if summary else None,
+                    },
+                )
+                row = cur.fetchone()
+                if not row:
+                    self._diagnose(cur, job_id, claim_token, "complete")
+        logger.info("Job %s COMPLETED at %s", job_id, row["completed_at"])
 
     def fail_job(
         self,
         job_id: int,
         claim_token: uuid.UUID,
         error_message: str,
-        max_attempts: int = 5,
-        retry_delay_minutes: int = 60,
-    ) -> None:
-        """Mark job as failed and schedule retry or mark permanently failed.
+        retryable: bool = True,
+    ) -> str:
+        """Record a failure: schedule a retry (PENDING) or mark FAILED.
 
-        Args:
-            job_id: Job ID
-            claim_token: Current claim token
-            error_message: Failure reason
-            max_attempts: Maximum retry attempts (default 5)
-            retry_delay_minutes: Delay before retry (default 60)
-
-        Raises:
-            ClaimTokenMismatchError: If token doesn't match
-            DatabaseError: If update fails
-        """
-        try:
-            with self.db.transaction() as conn:
-                with conn.cursor() as cur:
-                    # Get current attempt number
-                    cur.execute(
-                        "SELECT attempt_no FROM crawl_jobs WHERE id = %(job_id)s",
-                        {"job_id": job_id},
-                    )
-                    job_state = cur.fetchone()
-
-                    if not job_state:
-                        raise DatabaseError(f"Job {job_id} not found")
-
-                    attempt_no = job_state["attempt_no"]
-
-                    if attempt_no >= max_attempts:
-                        # Permanently failed
-                        # Note: error_message column added in migration 005
-                        cur.execute(
-                            """
-                            UPDATE crawl_jobs
-                            SET status = 'FAILED',
-                                lease_until = NULL,
-                                claim_token = NULL
-                            WHERE id = %(job_id)s
-                              AND claim_token = %(claim_token)s
-                            RETURNING id
-                            """,
-                            {
-                                "job_id": job_id,
-                                "claim_token": claim_token,
-                            },
-                        )
-
-                        result = cur.fetchone()
-
-                        if not result:
-                            raise ClaimTokenMismatchError(
-                                f"Cannot fail job {job_id}: claim token mismatch"
-                            )
-
-                        logger.error(
-                            f"Job {job_id} permanently FAILED after {attempt_no} attempts: {error_message}"
-                        )
-
-                    else:
-                        # Schedule retry
-                        cur.execute(
-                            """
-                            UPDATE crawl_jobs
-                            SET status = 'PENDING',
-                                run_after = clock_timestamp() + %(retry_interval)s::interval,
-                                lease_until = NULL,
-                                claim_token = NULL
-                            WHERE id = %(job_id)s
-                              AND claim_token = %(claim_token)s
-                            RETURNING id
-                            """,
-                            {
-                                "job_id": job_id,
-                                "claim_token": claim_token,
-                                "retry_interval": f"{retry_delay_minutes} minutes",
-                            },
-                        )
-
-                        result = cur.fetchone()
-
-                        if not result:
-                            raise ClaimTokenMismatchError(
-                                f"Cannot schedule retry for job {job_id}: claim token mismatch"
-                            )
-
-                        logger.warning(
-                            f"Job {job_id} failed (attempt {attempt_no}/{max_attempts}), "
-                            f"scheduled retry in {retry_delay_minutes}m: {error_message}"
-                        )
-
-                    # Clear current job tracking
-                    if self.current_job_id == job_id:
-                        self.current_job_id = None
-                        self.current_claim_token = None
-
-        except ClaimTokenMismatchError:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to handle job failure for {job_id}: {e}")
-            raise DatabaseError(f"Job failure handling failed: {e}") from e
-
-    def reclaim_expired_jobs(self) -> int:
-        """Reclaim jobs with expired leases.
-
-        Resets jobs back to PENDING when lease expires and worker disappeared.
-        Implements AD-002 recovery mechanism.
+        The job row is locked and ownership (token, RUNNING, lease) is verified in
+        the same transaction as the update, so attempt_no and the new state are
+        consistent and a stale worker cannot reset a job it lost.
 
         Returns:
-            Number of jobs reclaimed
-
-        Raises:
-            DatabaseError: If reclaim operation fails
+            'PENDING' if a retry was scheduled, 'FAILED' otherwise.
         """
-        try:
-            with self.db.transaction() as conn:
-                with conn.cursor() as cur:
-                    # Find and reset expired jobs
+        message = sanitize_error_message(error_message)
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                state = self.lock_owned_job(cur, job_id, claim_token)
+                attempt_no = state["attempt_no"]
+
+                if self.retry_policy.should_retry(attempt_no, retryable):
+                    delay = self.retry_policy.delay_seconds(attempt_no)
                     cur.execute(
                         """
                         UPDATE crawl_jobs
                         SET status = 'PENDING',
-                            run_after = clock_timestamp(),
+                            run_after = clock_timestamp() + make_interval(secs => %(delay)s),
+                            error_message = %(msg)s,
                             lease_until = NULL,
                             claim_token = NULL
-                        WHERE status = 'RUNNING'
-                          AND lease_until < clock_timestamp()
-                        RETURNING id, source_id
-                        """
+                        WHERE id = %(job_id)s AND claim_token = %(token)s
+                        RETURNING run_after
+                        """,
+                        {"job_id": job_id, "token": claim_token, "delay": delay, "msg": message},
                     )
+                    row = cur.fetchone()
+                    logger.warning(
+                        "Job %s failed (attempt %s/%s), retry at %s: %s",
+                        job_id, attempt_no, self.retry_policy.max_attempts, row["run_after"], message,
+                    )
+                    return "PENDING"
 
-                    reclaimed = cur.fetchall()
+                cur.execute(
+                    """
+                    UPDATE crawl_jobs
+                    SET status = 'FAILED',
+                        completed_at = clock_timestamp(),
+                        error_message = %(msg)s,
+                        lease_until = NULL,
+                        claim_token = NULL
+                    WHERE id = %(job_id)s AND claim_token = %(token)s
+                    RETURNING id
+                    """,
+                    {"job_id": job_id, "token": claim_token, "msg": message},
+                )
+                cur.fetchone()
+                logger.error(
+                    "Job %s permanently FAILED after %s attempt(s)%s: %s",
+                    job_id, attempt_no, "" if retryable else " (non-retryable)", message,
+                )
+                return "FAILED"
 
-                    if reclaimed:
-                        job_ids = [job["id"] for job in reclaimed]
-                        logger.warning(
-                            f"Reclaimed {len(reclaimed)} expired jobs: {job_ids}"
+    def release_job(self, job_id: int, claim_token: uuid.UUID, reason: str = "worker shutdown") -> None:
+        """Give an owned job back to the queue without counting the attempt."""
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                self.lock_owned_job(cur, job_id, claim_token)
+                cur.execute(
+                    """
+                    UPDATE crawl_jobs
+                    SET status = 'PENDING',
+                        run_after = clock_timestamp(),
+                        attempt_no = GREATEST(attempt_no - 1, 0),
+                        error_message = %(msg)s,
+                        lease_until = NULL,
+                        claim_token = NULL
+                    WHERE id = %(job_id)s AND claim_token = %(token)s
+                    """,
+                    {"job_id": job_id, "token": claim_token, "msg": sanitize_error_message(f"Released: {reason}")},
+                )
+        logger.info("Job %s released back to queue (%s)", job_id, reason)
+
+    def reclaim_expired_jobs(self) -> int:
+        """Reset RUNNING jobs whose lease expired.
+
+        The old claim token is cleared, so the previous owner is fenced out. A job
+        that already used all attempts becomes FAILED (crash loops cannot retry
+        forever); otherwise it is rescheduled with the retry backoff.
+        Rows locked by a live transaction (heartbeat/complete in progress) are
+        skipped and re-evaluated on the next pass.
+        """
+        reclaimed = 0
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, attempt_no, lease_until
+                    FROM crawl_jobs
+                    WHERE status = 'RUNNING'
+                      AND lease_until <= clock_timestamp()
+                    ORDER BY id
+                    FOR UPDATE SKIP LOCKED
+                    """
+                )
+                rows = cur.fetchall()
+                for row in rows:
+                    message = sanitize_error_message(
+                        f"Lease expired at {row['lease_until']} (worker lost or stalled) "
+                        f"on attempt {row['attempt_no']}"
+                    )
+                    if self.retry_policy.should_retry(row["attempt_no"]):
+                        cur.execute(
+                            """
+                            UPDATE crawl_jobs
+                            SET status = 'PENDING',
+                                run_after = clock_timestamp() + make_interval(secs => %(delay)s),
+                                error_message = %(msg)s,
+                                lease_until = NULL,
+                                claim_token = NULL
+                            WHERE id = %(id)s AND status = 'RUNNING' AND lease_until <= clock_timestamp()
+                            """,
+                            {"id": row["id"], "msg": message,
+                             "delay": self.retry_policy.delay_seconds(row["attempt_no"])},
                         )
-
-                    return len(reclaimed)
-
-        except Exception as e:
-            logger.error(f"Failed to reclaim expired jobs: {e}")
-            raise DatabaseError(f"Job reclaim failed: {e}") from e
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE crawl_jobs
+                            SET status = 'FAILED',
+                                completed_at = clock_timestamp(),
+                                error_message = %(msg)s,
+                                lease_until = NULL,
+                                claim_token = NULL
+                            WHERE id = %(id)s AND status = 'RUNNING' AND lease_until <= clock_timestamp()
+                            """,
+                            {"id": row["id"], "msg": message},
+                        )
+                    reclaimed += cur.rowcount
+        if reclaimed:
+            logger.warning("Reclaimed %s expired job(s): %s", reclaimed, [r["id"] for r in rows])
+        return reclaimed
 
     def verify_ownership(self, job_id: int, claim_token: uuid.UUID) -> None:
-        """Verify current ownership of job (for atomic fencing per AD-011).
+        """Point-in-time ownership check (no lock is held afterwards).
 
-        Uses PostgreSQL clock_timestamp() for lease validation to avoid clock skew issues.
-
-        Args:
-            job_id: Job ID
-            claim_token: Expected claim token
-
-        Raises:
-            ClaimTokenMismatchError: If token doesn't match
-            LeaseExpiredError: If lease expired
-            DatabaseError: If verification fails
+        Use it only to stop early; it does NOT protect later writes. Writes must
+        re-check ownership in their own transaction (see ``lock_owned_job``).
         """
-        try:
-            result = self.db.execute_one(
-                """
-                SELECT status, claim_token, lease_until, clock_timestamp() as db_now
-                FROM crawl_jobs
-                WHERE id = %(job_id)s
-                FOR UPDATE
-                """,
-                {"job_id": job_id},
-            )
-
-            if not result:
-                raise DatabaseError(f"Job {job_id} not found")
-
-            if result["claim_token"] != claim_token:
-                raise ClaimTokenMismatchError(
-                    f"Job {job_id} claim token mismatch (job reclaimed)"
+        with self.db.transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM crawl_jobs
+                    WHERE id = %(job_id)s AND claim_token = %(token)s
+                      AND status = 'RUNNING' AND lease_until > clock_timestamp()
+                    """,
+                    {"job_id": job_id, "token": claim_token},
                 )
-
-            if result["status"] != "RUNNING":
-                raise DatabaseError(
-                    f"Job {job_id} status is {result['status']}, expected RUNNING"
-                )
-
-            # Use database clock for lease expiration check (HIGH-001 fix)
-            if result["lease_until"] and result["lease_until"] < result["db_now"]:
-                raise LeaseExpiredError(
-                    f"Job {job_id} lease expired at {result['lease_until']} (database time: {result['db_now']})"
-                )
-
-            logger.debug(f"Job {job_id} ownership verified")
-
-        except (ClaimTokenMismatchError, LeaseExpiredError):
-            raise
-        except Exception as e:
-            logger.error(f"Failed to verify job ownership: {e}")
-            raise DatabaseError(f"Ownership verification failed: {e}") from e
+                if not cur.fetchone():
+                    self._diagnose(cur, job_id, claim_token, "verify")

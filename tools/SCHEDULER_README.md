@@ -1,254 +1,185 @@
-# Automatic Crawler Scheduler
+# Scheduler & Worker Tự động cho Crawler
 
-## Overview
+## Tổng quan
 
-The crawler scheduler automatically creates crawl jobs for enabled sources without manual intervention. This eliminates the need to manually trigger crawls via API.
+Hệ thống crawler gồm 2 service chạy độc lập và phối hợp qua PostgreSQL bằng role giới hạn quyền (`utc_worker`):
 
-## How It Works
+1. **`crawler-scheduler`** (`python -m src.scheduler`):
+   - Kiểm tra định kỳ (mặc định mỗi `300s` / 5 phút, cấu hình qua `SCHEDULER_CHECK_INTERVAL_SECONDS`).
+   - Tự động tạo crawl job ở trạng thái `PENDING` cho các nguồn `enabled = true` khi đã quá chu kỳ `crawl_interval_hours`.
+   - An toàn khi chạy nhiều instance song song nhờ partial unique index `crawl_jobs (source_id) WHERE status IN ('PENDING', 'RUNNING')` và `ON CONFLICT DO NOTHING`.
 
-1. **Scheduler Service** (`crawler-scheduler`): 
-   - Runs continuously alongside the worker
-   - Checks every 5 minutes if sources need crawling
-   - Creates jobs for sources that haven't been crawled within their interval
+2. **`crawler-worker`** (`python -m src.main`):
+   - Claim job nguyên tử bằng `FOR UPDATE SKIP LOCKED` kèm `claim_token` và `lease_until`.
+   - Duy trì lease bằng background `LeaseKeeper` theo thời gian thực (`WORKER_HEARTBEAT_INTERVAL_SECONDS`, mặc định `120s`, lease mặc định `600s`).
+   - Định kỳ thu hồi (reclaim) các job hết hạn lease từ worker bị treo/crash.
+   - Thực hiện discovery, fetch (chống SSRF + DNS rebinding), trích xuất (HTML, PDF, DOCX), chunking, embedding qua Ollama `/api/embed` (768 chiều) và lưu vào PostgreSQL.
 
-2. **Worker Service** (`crawler-worker`):
-   - Claims and processes jobs from the queue
-   - Performs actual crawling, extraction, and embedding
+---
 
-## Configuration
+## Cấu hình
 
-### Source-Level Crawl Interval
+### 1. Crawl Interval theo từng nguồn
 
-Each source can have its own crawl interval in the `crawl_sources` table:
+Mỗi nguồn trong `crawl_sources` có thể đặt chu kỳ riêng (đơn vị giờ, `> 0`). Nếu `NULL`, scheduler dùng `SCHEDULER_DEFAULT_INTERVAL_HOURS` (mặc định `6` giờ):
 
 ```sql
--- Set UTC main site to crawl every 6 hours (default)
-UPDATE crawl_sources 
-SET crawl_interval_hours = 6 
+UPDATE crawl_sources
+SET crawl_interval_hours = 6
 WHERE id = 1;
 
--- Set UTC2 site to crawl every 12 hours
-UPDATE crawl_sources 
-SET crawl_interval_hours = 12 
+UPDATE crawl_sources
+SET crawl_interval_hours = 12
 WHERE id = 2;
-
--- Set important pages to crawl every 2 hours
-UPDATE crawl_sources 
-SET crawl_interval_hours = 2 
-WHERE id = 3;
 ```
 
-**Default:** 6 hours if not specified
+### 2. Biến môi trường chính (`.env` / `compose.yaml`)
 
-### Scheduler Timing
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `POSTGRES_WORKER_USER` | `utc_worker` | Role PostgreSQL giới hạn quyền cho worker & scheduler |
+| `POSTGRES_WORKER_PASSWORD` | *(bắt buộc)* | Mật khẩu của `utc_worker` |
+| `SCHEDULER_CHECK_INTERVAL_SECONDS` | `300` | Chu kỳ kiểm tra nguồn của scheduler (giây) |
+| `SCHEDULER_DEFAULT_INTERVAL_HOURS` | `6` | Khoảng cách mặc định giữa các lần crawl (giờ) |
+| `WORKER_LEASE_DURATION_SECONDS` | `600` | Thời hạn lease của job (giây) |
+| `WORKER_HEARTBEAT_INTERVAL_SECONDS` | `120` | Chu kỳ gửi heartbeat gia hạn lease (phải ≤ lease/2) |
+| `JOB_MAX_ATTEMPTS` | `3` | Tổng số lần thử tối đa cho một job |
+| `JOB_RETRY_BASE_DELAY_SECONDS` | `900` | Delay gốc cho retry đầu tiên (15 phút) |
+| `JOB_RETRY_MAX_DELAY_SECONDS` | `21600` | Trần delay tối đa (6 giờ) |
+| `JOB_RETRY_JITTER_RATIO` | `0.2` | Jitter ±20% tránh retry đồng loạt |
+| `CRAWLER_RESPECT_ROBOTS` | `true` | Tuân thủ `robots.txt` và `Crawl-delay` |
+| `CRAWLER_AUTO_PUBLISH` | `true` | Tự động publish (`PUBLISHED`, `source_verified=true`) và archive bản cũ ngay sau khi index xong (`false` để giữ duyệt tay `PENDING`) |
+| `CRAWLER_RATE_LIMIT` | `2.0` | Rate limit mặc định giữa các request cùng domain (giây) |
 
-The scheduler checks for sources needing jobs every **5 minutes**. This is configured in `compose.yaml` but can be adjusted by modifying the `CrawlScheduler` initialization in `scheduler.py`:
+---
 
-```python
-scheduler = CrawlScheduler(
-    database=Database(config.database),
-    default_interval_hours=6,
-    check_interval_seconds=300,  # 5 minutes
-)
+## Logic lập lịch & Retry
+
+### Điều kiện tạo job mới
+
+Scheduler tạo job `PENDING` cho nguồn nếu **tất cả** điều kiện sau đúng:
+1. `crawl_sources.enabled = true`.
+2. Không có job `PENDING` hoặc `RUNNING` nào của nguồn đó.
+3. Chưa từng có job `COMPLETED`/`FAILED` trước đó, **hoặc** khoảng thời gian từ `COALESCE(completed_at, created_at)` của job hoàn thành/thất bại gần nhất đến hiện tại (`clock_timestamp()`) ≥ `crawl_interval_hours`.
+
+Khi worker hoàn tất job thành công, `complete_job()` luôn ghi `completed_at = clock_timestamp()`. Nhờ vậy chu kỳ crawl tiếp theo được tính chính xác từ thời điểm hoàn thành thực tế.
+
+### Chính sách Retry & Reclaim
+
+- `attempt_no` là số lần job đã được claim để thực thi (tăng khi `claim_job()`, hoàn lại nếu worker release do graceful shutdown).
+- Khi job gặp lỗi tạm thời (mất mạng, discovery thất bại, Ollama lỗi, tất cả URL lỗi...):
+  - Nếu `attempt_no < JOB_MAX_ATTEMPTS` (mặc định `3`), job quay về `PENDING` với `run_after = clock_timestamp() + delay`:
+    $$\text{delay} = \min(\text{base} \times 2^{\text{attempt\_no}-1},\ \text{max}) \times (1 \pm \text{jitter})$$
+    - Lần 1 thất bại → thử lại sau ~15 phút (`900s ± 20%`)
+    - Lần 2 thất bại → thử lại sau ~30 phút (`1800s ± 20%`)
+    - Lần 3 thất bại → chuyển sang `FAILED` vĩnh viễn và ghi `completed_at`.
+  - Lỗi không thể retry (ví dụ nguồn không tồn tại, regex cấu hình sai) sẽ chuyển thẳng sang `FAILED` ngay lần đầu.
+- Nguyên nhân lỗi được sanitize (che thông tin nhạy cảm, cắt gọn tối đa 2000 ký tự) và lưu vào `crawl_jobs.error_message` ở cả trường hợp retry lẫn `FAILED`.
+- Job đang `RUNNING` nhưng hết hạn `lease_until` sẽ được `reclaim_expired_jobs()` thu hồi (xóa `claim_token` cũ; chuyển về `PENDING` nếu còn lượt hoặc `FAILED` nếu đã hết `JOB_MAX_ATTEMPTS`).
+
+---
+
+## Database Role & Migrations
+
+### Quyền hạn của `utc_worker` (Least Privilege — Migration `008`)
+
+| Bảng | Quyền của `utc_worker` |
+|---|---|
+| `crawl_sources` | `SELECT` |
+| `crawl_jobs` | `SELECT, INSERT, UPDATE` |
+| `knowledge_documents` | `SELECT, INSERT` |
+| `document_revisions` | `SELECT, INSERT, UPDATE, DELETE` *(chỉ cleanup revision `INDEXING` do chính mình tạo)* |
+| `document_chunks` | `SELECT, INSERT, DELETE` |
+| Các bảng khác (`users`, `audit_events`, ...) | **Không có quyền** |
+
+Role `utc_worker` có `LOGIN`, `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOREPLICATION`, `CONNECTION LIMIT 20`.
+
+### Áp dụng Migration
+
+**1. Volume PostgreSQL mới hoàn toàn:**
+Các script trong `database/init/` (`001`..`010`) tự động chạy theo thứ tự, bao gồm `010-worker-password.sh` đặt mật khẩu cho `utc_worker` từ `POSTGRES_WORKER_PASSWORD`.
+
+**2. Volume PostgreSQL đã tồn tại:**
+`docker-entrypoint-initdb.d` **không tự chạy lại** khi volume đã có dữ liệu. Cần chạy các migration mới thủ công (tất cả đều idempotent):
+
+```powershell
+Get-Content -Raw database/init/005-crawler-complete.sql     | docker compose exec -T database sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+Get-Content -Raw database/init/006-worker-role.sql          | docker compose exec -T database sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+Get-Content -Raw database/init/007-scheduler-support.sql    | docker compose exec -T database sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+Get-Content -Raw database/init/008-worker-permissions-fix.sql | docker compose exec -T database sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+Get-Content -Raw database/init/009-scheduler-indexes.sql    | docker compose exec -T database sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 ```
 
-## Usage
+Sau đó đặt mật khẩu cho `utc_worker` khớp với `POSTGRES_WORKER_PASSWORD` trong `.env`:
 
-### Start Everything (Recommended)
+```powershell
+docker compose exec -T database sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v pw="$POSTGRES_WORKER_PASSWORD" -c "ALTER ROLE utc_worker WITH LOGIN PASSWORD :'\''pw'\''"'
+```
+
+---
+
+## Triển khai & Giám sát
+
+### Khởi động với Docker Compose
 
 ```bash
-docker compose up -d
+cp .env.example .env
+# Cập nhật POSTGRES_PASSWORD, POSTGRES_WORKER_PASSWORD, CURSOR_SECRET trong .env
+docker compose up -d --build
 ```
 
-This starts:
-- `crawler-scheduler`: Creates jobs automatically
-- `crawler-worker`: Processes jobs
-- All other services (database, backend, frontend, AI)
-
-### View Scheduler Logs
+### Xem logs
 
 ```bash
 docker compose logs -f crawler-scheduler
-```
-
-Expected output:
-```
-crawler-scheduler-1 | Scheduler starting: checking every 300s, default interval 6h
-crawler-scheduler-1 | Source 1 (UTC Main Site) has no previous jobs, scheduling
-crawler-scheduler-1 | Created job 123 for source 1 (UTC Main Site)
-crawler-scheduler-1 | Scheduled 1 new crawl jobs
-```
-
-### View Worker Logs
-
-```bash
 docker compose logs -f crawler-worker
 ```
 
-### Check Job Status
+### Kiểm tra trạng thái Crawl Jobs
 
-Via API:
-```bash
-curl -X GET http://localhost:8080/api/v1/ops/crawl-jobs
-```
-
-Or via database:
 ```sql
-SELECT 
+SELECT
     j.id,
     j.status,
-    s.name as source_name,
+    s.base_url AS source_url,
+    j.attempt_no,
     j.created_at,
+    j.run_after,
+    j.lease_until,
     j.completed_at,
     j.error_message
 FROM crawl_jobs j
 JOIN crawl_sources s ON j.source_id = s.id
 ORDER BY j.created_at DESC
-LIMIT 10;
+LIMIT 20;
 ```
 
-## Scheduling Logic
+### Kiểm tra danh sách nguồn
 
-A new job is created for a source if **ALL** conditions are met:
-
-1. ✅ Source is enabled (`enabled = true`)
-2. ✅ No PENDING or RUNNING job exists for this source
-3. ✅ Last completed job is older than `crawl_interval_hours`
-
-### Example Timeline
-
-**Source with 6-hour interval:**
-
-- 00:00 - Scheduler creates Job #1
-- 00:05 - Worker claims and starts Job #1
-- 00:30 - Worker completes Job #1
-- 01:00 - Scheduler checks: only 0.5h passed, skips
-- 02:00 - Scheduler checks: only 1.5h passed, skips
-- 06:30 - Scheduler checks: 6h passed, creates Job #2 ✅
-- 06:35 - Worker claims and starts Job #2
-
-## Manual Job Creation (Optional)
-
-You can still create jobs manually via API if needed:
-
-```bash
-curl -X POST http://localhost:8080/api/v1/ops/crawl-jobs \
-  -H "Content-Type: application/json" \
-  -d '{"source_id": 1}'
-```
-
-The scheduler will skip sources with active jobs, so manual and automatic scheduling coexist safely.
-
-## Troubleshooting
-
-### No Jobs Being Created
-
-1. **Check scheduler is running:**
-   ```bash
-   docker compose ps crawler-scheduler
-   ```
-
-2. **Check scheduler logs:**
-   ```bash
-   docker compose logs crawler-scheduler
-   ```
-
-3. **Verify sources are enabled:**
-   ```sql
-   SELECT id, name, enabled, crawl_interval_hours
-   FROM crawl_sources;
-   ```
-
-4. **Check for active jobs:**
-   ```sql
-   SELECT source_id, status, created_at
-   FROM crawl_jobs
-   WHERE status IN ('PENDING', 'RUNNING');
-   ```
-
-### Jobs Created But Not Processed
-
-This means the scheduler is working but the worker has issues:
-
-1. **Check worker is running:**
-   ```bash
-   docker compose ps crawler-worker
-   ```
-
-2. **Check worker logs:**
-   ```bash
-   docker compose logs crawler-worker
-   ```
-
-3. **Check Ollama is accessible:**
-   ```bash
-   docker compose exec crawler-worker curl http://ai:11434/api/tags
-   ```
-
-### Jobs Failing Repeatedly
-
-Check job error messages:
 ```sql
-SELECT id, source_id, status, error_message, attempt_no
-FROM crawl_jobs
-WHERE status = 'FAILED'
-ORDER BY completed_at DESC
-LIMIT 10;
+SELECT id, base_url, enabled, crawl_interval_hours, rate_limit_seconds, sitemap_url
+FROM crawl_sources
+ORDER BY id;
 ```
 
-Failed jobs are automatically retried up to 3 times with exponential backoff (1h delay between retries).
+### Kiểm tra trạng thái Document Revisions
 
-## Architecture
+Các trạng thái revision hợp lệ: `INDEXING`, `PENDING`, `PUBLISHED`, `ARCHIVED`, `REVOKED`.
 
-```
-┌─────────────────┐
-│   Database      │
-│  crawl_sources  │◄─────┐
-│  crawl_jobs     │      │
-└────────▲────────┘      │
-         │               │
-         │ creates       │ reads
-         │ jobs          │ sources
-         │               │
-┌────────┴────────┐      │
-│   Scheduler     │──────┘
-│  (runs every    │
-│   5 minutes)    │
-└─────────────────┘
+```sql
+SELECT status, COUNT(*)
+FROM document_revisions
+GROUP BY status;
 
-         ┌────────────────┐
-         │   Job Queue    │
-         │  (PENDING jobs)│
-         └────────▲───────┘
-                  │
-                  │ claims jobs
-                  │
-         ┌────────┴───────┐
-         │    Worker      │
-         │  (crawls URLs, │
-         │   generates    │
-         │   embeddings)  │
-         └────────────────┘
+-- Kiểm tra revision bị kẹt ở INDEXING quá 1 giờ
+SELECT id, document_id, crawl_job_id, updated_at
+FROM document_revisions
+WHERE status = 'INDEXING'
+  AND updated_at < NOW() - INTERVAL '1 hour';
 ```
 
-## Migration
+### Khắc phục sự cố nhanh
 
-The scheduler requires database migration `007-scheduler-support.sql` which adds:
-- `crawl_sources.crawl_interval_hours` column
-- `crawl_jobs.created_at` column
-
-This migration runs automatically when you start the database container.
-
-## Performance
-
-- **Scheduler overhead:** Minimal - runs every 5 minutes, queries are indexed
-- **Database load:** Each check runs 1-2 simple queries per enabled source
-- **Recommended setup:** 
-  - 1 scheduler instance (more is safe but unnecessary)
-  - 1-3 worker instances depending on crawl volume
-
-## See Also
-
-- Worker documentation: `tools/README.md`
-- Database schema: `database/init/002-schema.sql`
-- Job management: `tools/src/job_manager.py`
+1. **Scheduler không tạo job:** kiểm tra `docker compose logs crawler-scheduler`, xác nhận đã chạy migration `007`..`009`, kiểm tra `crawl_sources.enabled = true` và không có job `PENDING`/`RUNNING` đang treo.
+2. **Worker không xử lý job:** kiểm tra `docker compose ps crawler-worker`, `docker compose logs crawler-worker`, xác nhận `utc_worker` đã được đặt mật khẩu và Ollama đang healthy (`docker compose exec ai ollama list`).
+3. **Job `FAILED` liên tục:** xem cột `crawl_jobs.error_message` để biết nguyên nhân chi tiết (SSRF blocked, robots.txt disallowed/unavailable, HTTP timeout, site unreachable, lỗi regex cấu hình).
