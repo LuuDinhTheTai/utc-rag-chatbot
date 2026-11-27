@@ -50,24 +50,105 @@ services:
       start_period: 20s
     networks: [utc]
 
-  tools:
+  # Crawler worker - claims and processes crawl jobs using least-privilege utc_worker role
+  crawler-worker:
     build: ./tools
+    command: ["python", "-m", "src.main"]
     environment:
-      POSTGRES_HOST: database
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-utc_rag}
-      POSTGRES_USER: ${POSTGRES_USER:-utc}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      # Database Configuration (least-privilege worker role)
+      DATABASE_HOST: database
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${POSTGRES_DB:-utc_rag}
+      DATABASE_USER: ${POSTGRES_WORKER_USER:-utc_worker}
+      DATABASE_PASSWORD: ${POSTGRES_WORKER_PASSWORD:?Set POSTGRES_WORKER_PASSWORD in .env}
+      DATABASE_POOL_MIN_SIZE: "2"
+      DATABASE_POOL_MAX_SIZE: "5"
+      DATABASE_TIMEOUT_SECONDS: "30"
+      DATABASE_MAX_WAITING: "10"
+
+      # Ollama Configuration
       OLLAMA_BASE_URL: http://ai:11434
       SLM_MODEL: ${SLM_MODEL:-qwen3:0.6b}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-embeddinggemma:300m-qat-q4_0}
       EMBEDDING_DIMENSION: "768"
-      UTC_SOURCE_URL: ${UTC_SOURCE_URL:-https://tuyensinh.utc.edu.vn}
+      OLLAMA_CONNECT_TIMEOUT_SECONDS: "5"
+      OLLAMA_TIMEOUT_SECONDS: "120"
+      OLLAMA_EMBED_BATCH_SIZE: "16"
+      OLLAMA_MAX_RETRIES: "3"
+
+      # Crawler Configuration
+      CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT:-UTC-RAG-Crawler/1.0}
+      CRAWLER_RATE_LIMIT: ${CRAWLER_RATE_LIMIT:-2.0}
+      CRAWLER_TIMEOUT: ${CRAWLER_TIMEOUT:-30}
+      CRAWLER_MAX_RETRIES: ${CRAWLER_MAX_RETRIES:-3}
+      CRAWLER_MAX_REDIRECTS: ${CRAWLER_MAX_REDIRECTS:-5}
+      CRAWLER_MAX_CONTENT_MB: ${CRAWLER_MAX_CONTENT_MB:-50}
+      CRAWLER_RESPECT_ROBOTS: ${CRAWLER_RESPECT_ROBOTS:-true}
+      CRAWLER_AUTO_PUBLISH: ${CRAWLER_AUTO_PUBLISH:-true}
+      CRAWLER_ENABLE_OCR: ${CRAWLER_ENABLE_OCR:-false}
+
+      # Worker Lease / Heartbeat / Retry Configuration
+      WORKER_LEASE_DURATION_SECONDS: ${WORKER_LEASE_DURATION_SECONDS:-600}
+      WORKER_HEARTBEAT_INTERVAL_SECONDS: ${WORKER_HEARTBEAT_INTERVAL_SECONDS:-120}
+      JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
+      JOB_RETRY_BASE_DELAY_SECONDS: ${JOB_RETRY_BASE_DELAY_SECONDS:-900}
+      JOB_RETRY_MAX_DELAY_SECONDS: ${JOB_RETRY_MAX_DELAY_SECONDS:-21600}
+      JOB_RETRY_JITTER_RATIO: ${JOB_RETRY_JITTER_RATIO:-0.2}
+      WORKER_IDLE_POLL_MAX_SECONDS: "30"
+      WORKER_RECLAIM_INTERVAL_SECONDS: "60"
+      WORKER_LIVENESS_FILE: /tmp/crawler-worker.alive
     depends_on:
       database:
         condition: service_healthy
       ai:
         condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'import os, time, psycopg; p=os.environ[\"WORKER_LIVENESS_FILE\"]; assert time.time()-os.path.getmtime(p)<300; conn=psycopg.connect(host=os.environ[\"DATABASE_HOST\"], port=int(os.environ[\"DATABASE_PORT\"]), dbname=os.environ[\"DATABASE_NAME\"], user=os.environ[\"DATABASE_USER\"], password=os.environ[\"DATABASE_PASSWORD\"], connect_timeout=5); conn.execute(\"SELECT 1\").fetchone(); conn.close()'"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    networks: [utc]
+
+  # Crawler scheduler - creates crawl jobs periodically for enabled sources
+  crawler-scheduler:
+    build: ./tools
+    command: ["python", "-m", "src.scheduler"]
+    environment:
+      # Database Configuration (least-privilege worker role; scheduler does not need Ollama)
+      DATABASE_HOST: database
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${POSTGRES_DB:-utc_rag}
+      DATABASE_USER: ${POSTGRES_WORKER_USER:-utc_worker}
+      DATABASE_PASSWORD: ${POSTGRES_WORKER_PASSWORD:?Set POSTGRES_WORKER_PASSWORD in .env}
+      DATABASE_POOL_MIN_SIZE: "1"
+      DATABASE_POOL_MAX_SIZE: "2"
+      DATABASE_TIMEOUT_SECONDS: "30"
+      DATABASE_MAX_WAITING: "5"
+
+      # Scheduler Configuration
+      SCHEDULER_CHECK_INTERVAL_SECONDS: ${SCHEDULER_CHECK_INTERVAL_SECONDS:-300}
+      SCHEDULER_DEFAULT_INTERVAL_HOURS: ${SCHEDULER_DEFAULT_INTERVAL_HOURS:-6}
+      SCHEDULER_LIVENESS_FILE: /tmp/crawler-scheduler.alive
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c 'import os, time, psycopg; p=os.environ[\"SCHEDULER_LIVENESS_FILE\"]; max_age=int(os.environ.get(\"SCHEDULER_CHECK_INTERVAL_SECONDS\", \"300\"))*2+60; assert time.time()-os.path.getmtime(p)<max_age; conn=psycopg.connect(host=os.environ[\"DATABASE_HOST\"], port=int(os.environ[\"DATABASE_PORT\"]), dbname=os.environ[\"DATABASE_NAME\"], user=os.environ[\"DATABASE_USER\"], password=os.environ[\"DATABASE_PASSWORD\"], connect_timeout=5); conn.execute(\"SELECT 1\").fetchone(); conn.close()'"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     networks: [utc]
 
   database:
@@ -76,6 +157,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-utc_rag}
       POSTGRES_USER: ${POSTGRES_USER:-utc}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_WORKER_PASSWORD: ${POSTGRES_WORKER_PASSWORD:?Set POSTGRES_WORKER_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./database/init:/docker-entrypoint-initdb.d:ro
